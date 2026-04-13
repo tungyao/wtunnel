@@ -4,12 +4,18 @@
 #include "tls_session.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <getopt.h>
+#include <cstdio>
+#include <string>
+#include <unordered_map>
 
 class SimpleTlsServer {
 public:
-    SimpleTlsServer(uint16_t port) : port_(port) {}
+    SimpleTlsServer(uint16_t port, const std::string& bind_addr)
+        : port_(port), bind_addr_(bind_addr) {}
 
 
     
@@ -27,15 +33,18 @@ public:
         int opt = 1;
         setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
         
-        struct sockaddr_in addr;
+        struct sockaddr_in addr{};
         addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = INADDR_ANY;
-        addr.sin_port = htons(port_);
-        
+        addr.sin_port   = htons(port_);
+        if (inet_pton(AF_INET, bind_addr_.c_str(), &addr.sin_addr) != 1) {
+            PROXY_LOG_ERROR("[server] invalid bind address: " << bind_addr_);
+            return false;
+        }
+
         bind(listen_fd, (struct sockaddr*)&addr, sizeof(addr));
         listen(listen_fd, 128);
         set_nonblocking(listen_fd);
-        PROXY_LOG_INFO("[server] server listen " <<  port_ );
+        PROXY_LOG_INFO("[server] listening on " << bind_addr_ << ":" << port_);
         
         // 3. 将监听 FD 加入 Reactor
         reactor_.add(listen_fd, Event::READABLE, [this](int fd, int ev) {
@@ -79,15 +88,44 @@ private:
         fcntl(fd, F_SETFL, flags | O_NONBLOCK);
     }
 
-    uint16_t port_;
+    uint16_t    port_;
+    std::string bind_addr_;
     Reactor reactor_;
     TlsContext tls_ctx_;
     std::unordered_map<int, std::shared_ptr<TlsSession>> sessions_;
 };
 
-int main() {
-    signal(SIGPIPE, SIG_IGN); // 写已关闭 socket 返回 EPIPE 而非崩溃
-    SimpleTlsServer server(8443);
+static void print_usage(const char* prog) {
+    fprintf(stderr,
+        "Usage: %s [options]\n"
+        "\n"
+        "Options:\n"
+        "  -p <port>   Listen port         (default: 8443)\n"
+        "  -b <addr>   Bind address        (default: 0.0.0.0)\n"
+        "  -h          Show this help message\n"
+        "\n"
+        "Example:\n"
+        "  %s -p 8443 -b 0.0.0.0\n",
+        prog, prog);
+}
+
+int main(int argc, char* argv[]) {
+    signal(SIGPIPE, SIG_IGN);
+
+    uint16_t    port       = 8443;
+    std::string bind_addr  = "0.0.0.0";
+
+    int opt;
+    while ((opt = getopt(argc, argv, "p:b:h")) != -1) {
+        switch (opt) {
+        case 'p': port      = (uint16_t)std::stoi(optarg); break;
+        case 'b': bind_addr = optarg;                       break;
+        case 'h': print_usage(argv[0]); return 0;
+        default:  print_usage(argv[0]); return 1;
+        }
+    }
+
+    SimpleTlsServer server(port, bind_addr);
     server.run();
     return 0;
 }

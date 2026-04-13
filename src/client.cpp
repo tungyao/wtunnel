@@ -21,6 +21,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <signal.h>
+#include <getopt.h>
 #include <cstring>
 #include <string>
 #include <unordered_map>
@@ -96,8 +97,6 @@ public:
 
         // TLS with Chrome fingerprint
         if (!tls_ctx_.init_client()) return false;
-        // Tunnel server uses a self-signed cert; skip verification.
-        // In production this should pin the server's certificate instead.
         SSL_CTX_set_verify(tls_ctx_.ctx(), SSL_VERIFY_NONE, nullptr);
         tls_ctx_.configure_chrome_fingerprint();
         tls_ctx_.set_alpn({"h2", "http/1.1"});
@@ -761,6 +760,21 @@ private:
 // ─────────────────────────────────────────────────────────────────────────────
 // main
 // ─────────────────────────────────────────────────────────────────────────────
+static void print_usage(const char* prog) {
+    fprintf(stderr,
+        "Usage: %s [options]\n"
+        "\n"
+        "Options:\n"
+        "  -p <port>   Local HTTP proxy listen port (default: 8080)\n"
+        "  -H <host>   Tunnel server host           (default: 127.0.0.1)\n"
+        "  -P <port>   Tunnel server port           (default: 8443)\n"
+        "  -h          Show this help message\n"
+        "\n"
+        "Example:\n"
+        "  %s -p 8080 -H tunnel.example.com -P 8443\n",
+        prog, prog);
+}
+
 int main(int argc, char* argv[]) {
     signal(SIGPIPE, SIG_IGN);
 
@@ -768,9 +782,16 @@ int main(int argc, char* argv[]) {
     std::string tunnel_host  = "127.0.0.1";
     uint16_t    tunnel_port  = 8443;
 
-    if (argc >= 2) local_port  = (uint16_t)std::stoi(argv[1]);
-    if (argc >= 3) tunnel_host = argv[2];
-    if (argc >= 4) tunnel_port = (uint16_t)std::stoi(argv[3]);
+    int opt;
+    while ((opt = getopt(argc, argv, "p:H:P:h")) != -1) {
+        switch (opt) {
+        case 'p': local_port  = (uint16_t)std::stoi(optarg); break;
+        case 'H': tunnel_host = optarg;                       break;
+        case 'P': tunnel_port = (uint16_t)std::stoi(optarg); break;
+        case 'h': print_usage(argv[0]); return 0;
+        default:  print_usage(argv[0]); return 1;
+        }
+    }
 
     PROXY_LOG_INFO("[main] Starting wtunnel client");
     PROXY_LOG_INFO("[main] Local proxy  : 127.0.0.1:" << local_port);

@@ -612,7 +612,7 @@ def main():
         if not os.path.exists(args.server_bin):
             sys.exit(f"❌  server binary not found: {args.server_bin}")
         print(f"\n[server] launching {args.server_bin} ...")
-        launch([args.server_bin], "qtunnel_server")
+        launch([args.server_bin, "-p", str(sport)], "qtunnel_server")
         if not wait_port(shost, sport, retries=20):
             kill_all()
             sys.exit(f"❌  server failed to start on {shost}:{sport}")
@@ -632,7 +632,7 @@ def main():
                 proxy_available = False
             else:
                 print(f"[proxy]  launching {args.client_bin} ...")
-                launch([args.client_bin, str(pport), shost, str(sport)], "qtunnel_client")
+                launch([args.client_bin, "-p", str(pport), "-H", shost, "-P", str(sport)], "qtunnel_client")
                 proxy_available = wait_port(phost, pport, retries=20)
                 if not proxy_available:
                     print(f"\n  [{WARN}] proxy failed to start — proxy tests will be skipped")

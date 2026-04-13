@@ -291,7 +291,7 @@ def main():
     except OSError:
         if not args.no_auto_launch and os.path.exists(args.server_bin):
             print(f"\n[server] launching {args.server_bin} ...")
-            launch([args.server_bin], "qtunnel_server")
+            launch([args.server_bin, "-p", str(server_port)], "qtunnel_server")
             wait_port("127.0.0.1", server_port)
         else:
             print(f"\n[server] not running on 127.0.0.1:{server_port}, launch manually")
@@ -302,7 +302,7 @@ def main():
     except OSError:
         if not args.no_auto_launch and os.path.exists(args.client_bin):
             print(f"[proxy]  launching {args.client_bin} ...")
-            launch([args.client_bin, str(proxy_port), "127.0.0.1", str(server_port)],
+            launch([args.client_bin, "-p", str(proxy_port), "-H", "127.0.0.1", "-P", str(server_port)],
                    "qtunnel_client")
             if not wait_port(proxy_host, proxy_port, retries=30):
                 print(f"  [{FAIL}] proxy failed to start")
