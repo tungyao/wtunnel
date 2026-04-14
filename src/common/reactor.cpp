@@ -1,27 +1,55 @@
 #include "reactor.h"
 #include "logging.h"
-#include <algorithm>
-#include <unistd.h>
+#ifdef _WIN32
+#  include "posix_compat.h"
+#endif
+
+// ── helpers ──────────────────────────────────────────────────────────────────
+
+// Convert our Event flags → libuv poll events
+static int to_uv_events(int ev) {
+    int uv_ev = 0;
+    if (ev & Event::READABLE) uv_ev |= UV_READABLE;
+    if (ev & Event::WRITABLE) uv_ev |= UV_WRITABLE;
+    return uv_ev;
+}
+
+// Convert libuv poll events → our Event flags
+static int from_uv_events(int uv_ev, int status) {
+    int ev = 0;
+    if (status < 0) {
+        // libuv signals errors via negative status
+        ev |= Event::ERROR | Event::READABLE;
+        return ev;
+    }
+    if (uv_ev & UV_READABLE)    ev |= Event::READABLE;
+    if (uv_ev & UV_WRITABLE)    ev |= Event::WRITABLE;
+    if (uv_ev & UV_DISCONNECT)  ev |= Event::READABLE; // peer half-close → treat as readable
+    return ev;
+}
+
+// ── Reactor ───────────────────────────────────────────────────────────────────
 
 Reactor::Reactor()
-    : epoll_fd_(-1)
-    , initialized_(false) {
-}
+    : loop_(nullptr)
+    , loop_owned_(false)
+    , initialized_(false) {}
 
 Reactor::~Reactor() {
     shutdown();
 }
 
 bool Reactor::init() {
-    if (initialized_) {
-        return true;
-    }
+    if (initialized_) return true;
 
-    epoll_fd_ = epoll_create1(EPOLL_CLOEXEC);
-    if (epoll_fd_ < 0) {
-        PROXY_LOG_ERROR("epoll_create1 failed: " << errno);
+    loop_ = new uv_loop_t;
+    if (uv_loop_init(loop_) != 0) {
+        PROXY_LOG_ERROR("uv_loop_init failed");
+        delete loop_;
+        loop_ = nullptr;
         return false;
     }
+    loop_owned_ = true;
     initialized_ = true;
     return true;
 }
@@ -29,156 +57,144 @@ bool Reactor::init() {
 void Reactor::shutdown() {
     if (!initialized_) return;
 
-    if (epoll_fd_ >= 0) {
-#ifdef _WIN32
-        epoll_close(epoll_fd_);
-#else
-        close(epoll_fd_);
-#endif
-        epoll_fd_ = -1;
+    // Stop and close every poll handle
+    for (auto& [fd, info] : fds_) {
+        uv_poll_stop(&info->handle);
+        uv_close(reinterpret_cast<uv_handle_t*>(&info->handle), nullptr);
     }
+    // Run the loop once so libuv can process the close callbacks
+    if (loop_) uv_run(loop_, UV_RUN_NOWAIT);
+
+    for (auto& [fd, info] : fds_) delete info;
     fds_.clear();
+
+    if (loop_owned_ && loop_) {
+        uv_loop_close(loop_);
+        delete loop_;
+        loop_ = nullptr;
+    }
     initialized_ = false;
 }
 
+// ── poll callback (static) ────────────────────────────────────────────────────
+
+void Reactor::poll_cb(uv_poll_t* handle, int status, int uv_events) {
+    auto* info = static_cast<FdInfo*>(handle->data);
+    if (!info->armed) return;
+
+    int ev = from_uv_events(uv_events, status);
+    if (ev && info->callback) {
+        info->callback(info->fd, ev);
+    }
+}
+
+// ── public API ────────────────────────────────────────────────────────────────
+
 bool Reactor::add(int fd, int events, Callback callback) {
     if (!initialized_) return false;
+    if (fds_.count(fd)) return false;
 
-    if (fds_.find(fd) != fds_.end()) {
+    auto* info = new FdInfo;
+    info->fd       = fd;
+    info->events   = events;
+    info->callback = std::move(callback);
+    info->armed    = true;
+    info->handle.data = info;
+
+#ifdef _WIN32
+    SOCKET sock = posix_compat::native_socket(fd);
+    int uv_init_ret = (sock != INVALID_SOCKET)
+        ? uv_poll_init_socket(loop_, &info->handle, sock)
+        : uv_poll_init(loop_, &info->handle, fd);
+#else
+    int uv_init_ret = uv_poll_init(loop_, &info->handle, fd);
+#endif
+    if (uv_init_ret != 0) {
+        PROXY_LOG_ERROR("uv_poll_init failed for fd=" << fd);
+        delete info;
         return false;
     }
-    
-    struct epoll_event ev;
-    ev.events = EPOLLRDHUP; // 始终监听对端半关闭
-    if (events & Event::READABLE) ev.events |= EPOLLIN;
-    if (events & Event::WRITABLE) ev.events |= EPOLLOUT;
-    ev.data.fd = fd;
 
-    if (epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev) < 0) {
-        PROXY_LOG_ERROR("epoll_ctl ADD failed for fd=" << fd << " errno=" << errno);
+    int uv_ev = to_uv_events(events);
+    if (uv_ev && uv_poll_start(&info->handle, uv_ev, poll_cb) != 0) {
+        PROXY_LOG_ERROR("uv_poll_start failed for fd=" << fd);
+        uv_close(reinterpret_cast<uv_handle_t*>(&info->handle), nullptr);
+        uv_run(loop_, UV_RUN_NOWAIT);
+        delete info;
         return false;
     }
-    
-    FdInfo info;
-    info.events = events;
-    info.callback = std::move(callback);
-    info.armed = true;
+
     fds_[fd] = info;
     return true;
 }
 
 bool Reactor::modify(int fd, int events) {
     if (!initialized_) return false;
-
     auto it = fds_.find(fd);
-    if (it == fds_.end()) {
-        return false;
-    }
-    
-    struct epoll_event ev;
-    ev.events = EPOLLRDHUP;
-    if (events & Event::READABLE) ev.events |= EPOLLIN;
-    if (events & Event::WRITABLE) ev.events |= EPOLLOUT;
-    ev.data.fd = fd;
+    if (it == fds_.end()) return false;
 
-    if (epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev) < 0) {
-        PROXY_LOG_ERROR("epoll_ctl MOD failed for fd=" << fd << " errno=" << errno);
-        return false;
+    FdInfo* info = it->second;
+    info->events = events;
+    info->armed  = true;
+
+    int uv_ev = to_uv_events(events);
+    if (uv_ev) {
+        uv_poll_start(&info->handle, uv_ev, poll_cb);
+    } else {
+        uv_poll_stop(&info->handle);
     }
-    
-    it->second.events = events;
     return true;
 }
 
 bool Reactor::remove(int fd) {
     if (!initialized_) return false;
-
     auto it = fds_.find(fd);
-    if (it == fds_.end()) {
-        return false;
-    }
-    
-    struct epoll_event ev;
-    epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, &ev);
+    if (it == fds_.end()) return false;
+
+    FdInfo* info = it->second;
+    uv_poll_stop(&info->handle);
+    uv_close(reinterpret_cast<uv_handle_t*>(&info->handle),
+             [](uv_handle_t* h) {
+                 delete static_cast<FdInfo*>(h->data);
+             });
     fds_.erase(it);
     return true;
 }
 
 bool Reactor::arm(int fd, int events) {
-    if (!initialized_) return false;
-
-    auto it = fds_.find(fd);
-    if (it == fds_.end()) {
-        return false;
-    }
-    
-    struct epoll_event ev;
-    ev.events = 0;
-    if (events & Event::READABLE) ev.events |= EPOLLIN;
-    if (events & Event::WRITABLE) ev.events |= EPOLLOUT;
-    ev.data.fd = fd;
-    
-    if (epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev) < 0) {
-        return false;
-    }
-    
-    it->second.armed = true;
-    it->second.events = events;
-    return true;
+    return modify(fd, events);   // arm = modify + set armed flag (already done in modify)
 }
 
 bool Reactor::disarm(int fd) {
     if (!initialized_) return false;
-
     auto it = fds_.find(fd);
-    if (it == fds_.end()) {
-        return false;
-    }
-    
-    struct epoll_event ev;
-    ev.events = 0;
-    ev.data.fd = fd;
-    
-    if (epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev) < 0) {
-        return false;
-    }
-    
-    it->second.armed = false;
+    if (it == fds_.end()) return false;
+
+    FdInfo* info = it->second;
+    info->armed = false;
+    uv_poll_stop(&info->handle);
     return true;
 }
 
 int Reactor::wait(int timeout_ms) {
     if (!initialized_) return -1;
 
-    const int MAX_EVENTS = 128;
-    struct epoll_event events[MAX_EVENTS];
-    
-    int n = epoll_wait(epoll_fd_, events, MAX_EVENTS, timeout_ms);
-    if (n <= 0) {
-        return n;
+    // UV_RUN_NOWAIT processes ready events without blocking.
+    // For a timed wait we use a one-shot timer to break out of UV_RUN_ONCE.
+    if (timeout_ms == 0) {
+        return uv_run(loop_, UV_RUN_NOWAIT);
     }
-    
-    int triggered = 0;
-    for (int i = 0; i < n; ++i) {
-        int fd = events[i].data.fd;
-        auto it = fds_.find(fd);
-        if (it == fds_.end() || !it->second.armed) continue;
-        
-        int ev = 0;
-        if (events[i].events & EPOLLIN)    ev |= Event::READABLE;
-        if (events[i].events & EPOLLOUT)   ev |= Event::WRITABLE;
-        if (events[i].events & EPOLLRDHUP) ev |= Event::READABLE; // 对端半关闭，当作可读处理
-        if (events[i].events & (EPOLLERR | EPOLLHUP)) {
-            // 错误/挂起：无论是否有读写事件都必须通知，让 session 通过 SSL_read 感知断开
-            ev |= Event::ERROR;
-            ev |= Event::READABLE;
-        }
 
-        if (ev && it->second.callback) {
-            it->second.callback(fd, ev);
-            triggered++;
-        }
-    }
-    
-    return triggered;
+    uv_timer_t timer;
+    uv_timer_init(loop_, &timer);
+    // Dummy callback — just wakes the loop
+    uv_timer_start(&timer, [](uv_timer_t*) {}, timeout_ms, 0);
+
+    uv_run(loop_, UV_RUN_ONCE);
+
+    uv_timer_stop(&timer);
+    uv_close(reinterpret_cast<uv_handle_t*>(&timer), nullptr);
+    uv_run(loop_, UV_RUN_NOWAIT); // drain the close callback
+
+    return 0; // libuv doesn't give a triggered-count; callers only check >=0
 }

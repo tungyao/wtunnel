@@ -7,7 +7,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 if(MSVC)
-    add_definitions(-D_WIN32_WINNT=0x0601 -DWIN32_LEAN_AND_MEAN -DNOMINMAX)
+    add_definitions(-D_WIN32_WINNT=0x0A00 -DWIN32_LEAN_AND_MEAN -DNOMINMAX)
 else()
 endif()
 
@@ -45,8 +45,20 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(nghttp2)
 
+set(LIBUV_GIT_REPOSITORY "https://github.com/libuv/libuv.git" CACHE STRING "libuv Git repository")
+set(LIBUV_GIT_TAG "v1.49.2" CACHE STRING "Pinned libuv tag to fetch")
+set(LIBUV_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    libuv
+    GIT_REPOSITORY ${LIBUV_GIT_REPOSITORY}
+    GIT_TAG ${LIBUV_GIT_TAG}
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(libuv)
+
 set(BORINGSSL_INCLUDE_DIR ${boringssl_SOURCE_DIR}/include)
 set(NGHTTP2_INCLUDE_DIR ${nghttp2_SOURCE_DIR}/lib/includes)
+set(NGHTTP2_BUILD_INCLUDE_DIR ${nghttp2_BINARY_DIR}/lib/includes)
 
 set(HOMEPAGE_HTML_INPUT ${CMAKE_CURRENT_SOURCE_DIR}/src/code.html)
 set(HOMEPAGE_HTML_HEADER ${GENERATED_INCLUDE_DIR}/homepage_html.h)
@@ -64,93 +76,64 @@ add_custom_command(
 
 add_custom_target(generate_homepage_header DEPENDS ${HOMEPAGE_HTML_HEADER})
 
-if(WIN32)
-    add_executable(qtunnel_server src/windows_stub/qtunnel_server_stub.cpp)
-    add_executable(qtunnel_client
-        src/client.cpp
-        src/local_proxy_server.cpp
-        src/tunnel_client.cpp
-        src/tunnel_connection.cpp
-        src/http2_session_driver.cpp
-        src/obfuscator.cpp
-        src/common/reactor.cpp
-        src/common/epoll_compat_win.cpp
-        src/common/buffer_pool.cpp
-        src/common/tls_wrapper.cpp
-    )
-    target_include_directories(qtunnel_client PRIVATE ${COMMON_INCLUDE_DIR})
-    add_executable(local_proxy src/windows_stub/local_proxy_stub.cpp)
-else()
-    add_executable(qtunnel_server
-        src/server.cpp
-        src/tls_session.cpp
-        # src/server_connection.cpp
-        # src/tunnel_connection.cpp
-        # src/nghttp2_session.cpp
-        # src/upstream_peer.cpp
-        src/dns_resolver.cpp
-        src/obfuscator.cpp
-        src/common/reactor.cpp
-        src/common/buffer_pool.cpp
-        src/common/tls_wrapper.cpp
-        ${HOMEPAGE_HTML_HEADER}
-    )
-    add_dependencies(qtunnel_server generate_homepage_header)
-    target_include_directories(qtunnel_server PRIVATE ${COMMON_INCLUDE_DIR} ${GENERATED_INCLUDE_DIR})
-
-    add_executable(qtunnel_client
-        src/client.cpp
-        src/obfuscator.cpp
-        src/common/reactor.cpp
-        src/common/buffer_pool.cpp
-        src/common/tls_wrapper.cpp
-    )
-    target_include_directories(qtunnel_client PRIVATE ${COMMON_INCLUDE_DIR})
-endif()
-
-if(MSVC)
-    target_compile_options(qtunnel_server PRIVATE
-        /W4
-        /EHsc
-        /permissive-
-        /utf-8
-        $<$<CONFIG:Release>:/O2>
-        $<$<CONFIG:RelWithDebInfo>:/O2>
-        $<$<CONFIG:MinSizeRel>:/O1>
-    )
-    target_compile_options(qtunnel_client PRIVATE
-        /W4
-        /EHsc
-        /permissive-
-        /utf-8
-        $<$<CONFIG:Release>:/O2>
-        $<$<CONFIG:RelWithDebInfo>:/O2>
-        $<$<CONFIG:MinSizeRel>:/O1>
-    )
-
-else()
-    target_compile_options(qtunnel_server PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter -Os)
-    target_compile_options(qtunnel_client PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter -Os)
-endif()
-
-set(PROXY_TLS_LIBRARIES nghttp2_static)
-if(WIN32)
-    list(APPEND PROXY_TLS_LIBRARIES ws2_32)
-else()
-    list(APPEND PROXY_TLS_LIBRARIES pthread)
-endif()
+set(COMMON_SOURCES
+    src/common/reactor.cpp
+    src/common/buffer_pool.cpp
+    src/common/tls_wrapper.cpp
+)
 
 add_library(proxy_tls_ssl INTERFACE)
 target_link_libraries(proxy_tls_ssl INTERFACE ssl crypto)
 target_include_directories(proxy_tls_ssl INTERFACE
     ${BORINGSSL_INCLUDE_DIR}
     ${NGHTTP2_INCLUDE_DIR}
+    ${NGHTTP2_BUILD_INCLUDE_DIR}
 )
 
 if(WIN32)
-    target_link_libraries(qtunnel_server PRIVATE ws2_32)
-    target_link_libraries(qtunnel_client PRIVATE proxy_tls_ssl ${PROXY_TLS_LIBRARIES})
+    set(PROXY_LINK_LIBS proxy_tls_ssl nghttp2_static uv_a ws2_32 iphlpapi userenv psapi)
 else()
-    target_link_libraries(qtunnel_server PRIVATE proxy_tls_ssl ${PROXY_TLS_LIBRARIES})
-    target_link_libraries(qtunnel_client PRIVATE proxy_tls_ssl ${PROXY_TLS_LIBRARIES})
+    set(PROXY_LINK_LIBS proxy_tls_ssl nghttp2_static uv_a pthread)
 endif()
+
+# ── server: Linux only ────────────────────────────────────────────────────────
+if(NOT WIN32)
+    add_executable(qtunnel_server
+        src/server.cpp
+        src/tls_session.cpp
+        src/dns_resolver.cpp
+        src/obfuscator.cpp
+        ${COMMON_SOURCES}
+        ${HOMEPAGE_HTML_HEADER}
+    )
+    add_dependencies(qtunnel_server generate_homepage_header)
+    target_include_directories(qtunnel_server PRIVATE
+        ${COMMON_INCLUDE_DIR}
+        ${GENERATED_INCLUDE_DIR}
+        ${libuv_SOURCE_DIR}/include
+        ${BORINGSSL_INCLUDE_DIR}
+        ${NGHTTP2_INCLUDE_DIR}
+        ${NGHTTP2_BUILD_INCLUDE_DIR}
+    )
+    target_compile_options(qtunnel_server PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter -Os)
+    target_link_libraries(qtunnel_server PRIVATE ${PROXY_LINK_LIBS})
+endif()
+
+# ── client: cross-platform ────────────────────────────────────────────────────
+add_executable(qtunnel_client
+    src/client.cpp
+    src/obfuscator.cpp
+    ${COMMON_SOURCES}
+)
+target_include_directories(qtunnel_client PRIVATE
+    ${COMMON_INCLUDE_DIR}
+    ${libuv_SOURCE_DIR}/include
+)
+
+if(WIN32)
+    target_compile_options(qtunnel_client PRIVATE /W4 /EHsc /permissive- /utf-8 $<$<CONFIG:Release>:/O2>)
+else()
+    target_compile_options(qtunnel_client PRIVATE -Wall -Wextra -Wpedantic -Wno-unused-parameter -Os)
+endif()
+
+target_link_libraries(qtunnel_client PRIVATE ${PROXY_LINK_LIBS})

@@ -35,7 +35,7 @@ static bool parse_authority(const std::string& auth, std::string& host, uint16_t
 
 static int tcp_connect_nb(const std::string& host, uint16_t port) {
     struct addrinfo hints{}, *res = nullptr;
-    hints.ai_family   = AF_UNSPEC;
+    hints.ai_family   = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     std::string ps = std::to_string(port);
     if (getaddrinfo(host.c_str(), ps.c_str(), &hints, &res) != 0 || !res)

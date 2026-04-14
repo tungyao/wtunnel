@@ -14,14 +14,32 @@
 #include "common/logging.h"
 #include <nghttp2/nghttp2.h>
 
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <signal.h>
-#include <getopt.h>
+#ifdef _WIN32
+#  include "common/posix_compat.h"
+   // getopt is not available on MSVC; use a minimal inline implementation
+   static int   optind_w = 1;
+   static char* optarg_w = nullptr;
+#  define optind optind_w
+#  define optarg optarg_w
+   static int getopt(int argc, char* argv[], const char* opts) {
+       if (optind >= argc || argv[optind][0] != '-') return -1;
+       char c = argv[optind][1];
+       const char* p = strchr(opts, c);
+       if (!p) return '?';
+       optind++;
+       if (*(p + 1) == ':') { optarg = argv[optind++]; }
+       return c;
+   }
+#else
+#  include <sys/socket.h>
+#  include <netinet/in.h>
+#  include <arpa/inet.h>
+#  include <netdb.h>
+#  include <fcntl.h>
+#  include <unistd.h>
+#  include <signal.h>
+#  include <getopt.h>
+#endif
 #include <cstring>
 #include <string>
 #include <unordered_map>
@@ -42,8 +60,37 @@ class ProxyServer;
 // Utility
 // ─────────────────────────────────────────────────────────────────────────────
 static void set_nonblocking(int fd) {
+#ifdef _WIN32
+    SOCKET s = posix_compat::native_socket(fd);
+    if (s != INVALID_SOCKET) { u_long m = 1; ioctlsocket(s, FIONBIO, &m); }
+#else
     int flags = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+#endif
+}
+
+static void close_fd(int fd) {
+#ifdef _WIN32
+    close(fd);   // posix_compat::close via posix_compat.h
+#else
+    ::close(fd);
+#endif
+}
+
+static ssize_t sock_recv(int fd, void* buf, size_t len, int flags) {
+#ifdef _WIN32
+    return posix_compat::recv_fd(fd, buf, len, flags);
+#else
+    return ::recv(fd, buf, len, flags);
+#endif
+}
+
+static ssize_t sock_send(int fd, const void* buf, size_t len, int flags) {
+#ifdef _WIN32
+    return posix_compat::send_fd(fd, buf, len, flags);
+#else
+    return ::send(fd, buf, len, flags | MSG_NOSIGNAL);
+#endif
 }
 
 static int tcp_connect(const std::string& host, uint16_t port) {
@@ -55,11 +102,17 @@ static int tcp_connect(const std::string& host, uint16_t port) {
         PROXY_LOG_ERROR("[client] getaddrinfo failed for " << host << ":" << port);
         return -1;
     }
-    int fd = socket(res->ai_family, SOCK_STREAM, 0);
+#ifdef _WIN32
+    int fd = posix_compat::socket_fd(res->ai_family, SOCK_STREAM, 0);
+    if (fd < 0) { freeaddrinfo(res); return -1; }
+    if (posix_compat::connect_fd(fd, res->ai_addr, (socklen_t)res->ai_addrlen) < 0) {
+#else
+    int fd = (int)socket(res->ai_family, SOCK_STREAM, 0);
     if (fd < 0) { freeaddrinfo(res); return -1; }
     if (::connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
+#endif
         freeaddrinfo(res);
-        ::close(fd);
+        close_fd(fd);
         return -1;
     }
     freeaddrinfo(res);
@@ -103,7 +156,7 @@ public:
 
         if (!tls_sock_.connect(fd_, tls_ctx_, host)) {
             PROXY_LOG_ERROR("[tunnel] TLS connect initiation failed");
-            ::close(fd_);
+            close_fd(fd_);
             fd_ = -1;
             return false;
         }
@@ -112,7 +165,7 @@ public:
         while (!tls_sock_.is_connected()) {
             if (!tls_sock_.continue_handshake()) {
                 PROXY_LOG_ERROR("[tunnel] TLS handshake failed");
-                ::close(fd_);
+                close_fd(fd_);
                 fd_ = -1;
                 return false;
             }
@@ -522,7 +575,7 @@ public:
     ~LocalSession() {
         if (stream_id_ >= 0) tunnel_->close_stream(stream_id_);
         reactor_.remove(fd_);
-        ::close(fd_);
+        close_fd(fd_);
     }
 
     void start() {
@@ -552,7 +605,7 @@ private:
     // Parse "CONNECT host:port HTTP/1.1\r\n..." from browser
     void read_connect_request() {
         char buf[4096];
-        ssize_t n = ::recv(fd_, buf, sizeof(buf) - 1, 0);
+        ssize_t n = sock_recv(fd_, buf, sizeof(buf) - 1, 0);
         if (n <= 0) { do_close(); return; }
         buf[n] = '\0';
         incoming_buf_.insert(incoming_buf_.end(), buf, buf + n);
@@ -573,7 +626,7 @@ private:
         if (method != "CONNECT") {
             // Non-CONNECT: return 405
             const char* resp = "HTTP/1.1 405 Method Not Allowed\r\n\r\n";
-            ::send(fd_, resp, strlen(resp), 0);
+            sock_send(fd_, resp, strlen(resp), 0);
             do_close();
             return;
         }
@@ -610,7 +663,7 @@ private:
 
         if (stream_id_ < 0) {
             const char* resp = "HTTP/1.1 503 Tunnel Failed\r\n\r\n";
-            ::send(fd_, resp, strlen(resp), 0);
+            sock_send(fd_, resp, strlen(resp), 0);
             do_close();
         }
     }
@@ -618,7 +671,7 @@ private:
     void on_tunnel_ready() {
         // Send "200 Connection Established" to browser
         const char* resp = "HTTP/1.1 200 Connection Established\r\n\r\n";
-        ::send(fd_, resp, strlen(resp), 0);
+        sock_send(fd_, resp, strlen(resp), 0);
         state_ = State::TUNNELING;
         reactor_.modify(fd_, Event::READABLE);
         PROXY_LOG_INFO("[local] Tunnel ready, relaying fd=" << fd_);
@@ -633,7 +686,7 @@ private:
     void forward_to_tunnel() {
         // Read from browser, send to tunnel
         uint8_t buf[16384];
-        ssize_t n = ::recv(fd_, buf, sizeof(buf), 0);
+        ssize_t n = sock_recv(fd_, buf, sizeof(buf), 0);
         if (n <= 0) {
             tunnel_->close_stream(stream_id_);
             stream_id_ = -1;
@@ -648,11 +701,17 @@ private:
             size_t chunk = std::min(to_browser_buf_.size(), (size_t)16384);
             uint8_t tmp[16384];
             std::copy(to_browser_buf_.begin(), to_browser_buf_.begin() + chunk, tmp);
-            ssize_t n = ::send(fd_, tmp, chunk, MSG_NOSIGNAL);
+            ssize_t n = sock_send(fd_, tmp, chunk, 0);
             if (n > 0) {
                 to_browser_buf_.erase(to_browser_buf_.begin(),
                                       to_browser_buf_.begin() + n);
-            } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            } else if (n < 0 && (
+#ifdef _WIN32
+                WSAGetLastError() == WSAEWOULDBLOCK
+#else
+                errno == EAGAIN || errno == EWOULDBLOCK
+#endif
+            )) {
                 // Enable WRITABLE to retry
                 reactor_.modify(fd_, Event::READABLE | Event::WRITABLE);
                 return;
@@ -705,7 +764,11 @@ public:
         }
 
         // Listen locally
+#ifdef _WIN32
+        listen_fd_ = posix_compat::socket_fd(AF_INET, SOCK_STREAM, 0);
+#else
         listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+#endif
         int opt = 1;
         setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
@@ -713,8 +776,13 @@ public:
         addr.sin_family      = AF_INET;
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // 127.0.0.1 only
         addr.sin_port        = htons(local_port_);
+#ifdef _WIN32
+        posix_compat::bind_fd(listen_fd_, (struct sockaddr*)&addr, sizeof(addr));
+        posix_compat::listen_fd(listen_fd_, 128);
+#else
         bind(listen_fd_, (struct sockaddr*)&addr, sizeof(addr));
         listen(listen_fd_, 128);
+#endif
         set_nonblocking(listen_fd_);
 
         PROXY_LOG_INFO("[proxy] Local HTTP proxy listening on 127.0.0.1:" << local_port_);
@@ -733,7 +801,11 @@ private:
     void on_accept(int listen_fd) {
         struct sockaddr_in addr{};
         socklen_t len = sizeof(addr);
+#ifdef _WIN32
+        int client_fd = posix_compat::accept_fd(listen_fd, (struct sockaddr*)&addr, &len);
+#else
         int client_fd = ::accept(listen_fd, (struct sockaddr*)&addr, &len);
+#endif
         if (client_fd < 0) return;
         set_nonblocking(client_fd);
 
@@ -776,7 +848,12 @@ static void print_usage(const char* prog) {
 }
 
 int main(int argc, char* argv[]) {
+#ifdef _WIN32
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+#else
     signal(SIGPIPE, SIG_IGN);
+#endif
 
     uint16_t    local_port   = 8080;
     std::string tunnel_host  = "127.0.0.1";
