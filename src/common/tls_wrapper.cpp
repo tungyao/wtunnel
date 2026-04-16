@@ -5,10 +5,12 @@
 #include <openssl/pem.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
+#include "../reality_marker.h"
 #ifndef _WIN32
 #  include <unistd.h>
 #endif
 #include <cstring>
+#include <chrono>
 
 namespace {
 
@@ -418,7 +420,12 @@ bool TlsSocket::connect(int fd, TlsContext& ctx, const std::string& hostname) {
     if (!ssl_) {
         return false;
     }
-    
+
+    // 若已调用 set_reality_bind()，现在把 bind_data_ 挂到 SSL ex_data
+    if (bind_data_.active && g_reality_ex_idx >= 0) {
+        SSL_set_ex_data(ssl_, g_reality_ex_idx, &bind_data_);
+    }
+
     if (!hostname.empty()) {
         SSL_set_tlsext_host_name(ssl_, hostname.c_str());
     }
@@ -579,4 +586,41 @@ bool TlsSocket::has_pending() const {
     // SSL_pending 返回已解密但在应用层缓冲区的数据
     // SSL_has_pending 检查是否有未处理的 TLS 记录（BoringSSL 特有）
     return (SSL_pending(ssl_) > 0) || SSL_has_pending(ssl_);
+}
+
+// ─── REALITY 客户端 session_id 嵌入 ─────────────────────────────────────────
+
+// 全局 ex_data 索引：每个 SSL 对象上挂 RealityBindData*
+int g_reality_ex_idx = -1;
+
+// session_id 回调：BoringSSL 生成随机 session_id 后调用，我们把标记写入前 16 字节
+// 后 16 字节保持 BoringSSL 生成的随机值，整体仍像 32 字节随机数
+static void reality_session_id_cb(SSL* ssl, uint8_t session_id[32], void* /*arg*/) {
+    auto* bd = static_cast<RealityBindData*>(
+        SSL_get_ex_data(ssl, g_reality_ex_idx));
+    if (!bd || !bd->active) return;
+
+    // 覆写前 16 字节，后 16 字节（已由 BoringSSL 随机填充）保持不动
+    reality_make_marker(bd->psk, session_id);
+}
+
+void TlsContext::enable_reality_bind_client() {
+    if (reality_client_registered_ || !ctx_) return;
+    if (g_reality_ex_idx < 0) {
+        g_reality_ex_idx = SSL_get_ex_new_index(0, nullptr, nullptr, nullptr, nullptr);
+    }
+    SSL_CTX_set_client_session_id_cb(ctx_, reality_session_id_cb, nullptr);
+    reality_client_registered_ = true;
+}
+
+void TlsContext::enable_reality_bind_server() {
+    // 服务端通过 reality_verify_client_hello() 解析原始字节，无需 TLS 回调
+}
+
+void TlsSocket::set_reality_bind(const std::string& psk) {
+    bind_data_.active = true;
+    bind_data_.psk    = psk;
+    if (ssl_ && g_reality_ex_idx >= 0) {
+        SSL_set_ex_data(ssl_, g_reality_ex_idx, &bind_data_);
+    }
 }

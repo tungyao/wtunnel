@@ -150,26 +150,18 @@ public:
             return false;
         }
 
-        // REALITY 模式：TLS 握手前先发送身份标记
-        if (!reality_psk_.empty()) {
-            uint8_t marker[16];
-            if (!reality_make_marker(reality_psk_, marker)) {
-                PROXY_LOG_ERROR("[tunnel] Failed to generate reality marker");
-                close_fd(fd_); fd_ = -1; return false;
-            }
-            ssize_t sent = sock_send(fd_, marker, sizeof(marker), 0);
-            if (sent != (ssize_t)sizeof(marker)) {
-                PROXY_LOG_ERROR("[tunnel] Failed to send reality marker");
-                close_fd(fd_); fd_ = -1; return false;
-            }
-            PROXY_LOG_INFO("[tunnel] REALITY marker sent");
-        }
-
         // TLS with Chrome fingerprint
         if (!tls_ctx_.init_client()) return false;
         SSL_CTX_set_verify(tls_ctx_.ctx(), SSL_VERIFY_NONE, nullptr);
         tls_ctx_.configure_chrome_fingerprint();
         tls_ctx_.set_alpn({"h2", "http/1.1"});
+
+        // REALITY 模式：在 ClientHello 扩展里嵌入身份标记
+        if (!reality_psk_.empty()) {
+            tls_ctx_.enable_reality_bind_client();
+            tls_sock_.set_reality_bind(reality_psk_);
+            PROXY_LOG_INFO("[tunnel] REALITY bind configured (ClientHello extension)");
+        }
 
         if (!tls_sock_.connect(fd_, tls_ctx_, host)) {
             PROXY_LOG_ERROR("[tunnel] TLS connect initiation failed");

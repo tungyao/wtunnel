@@ -30,8 +30,11 @@ set(BORINGSSL_ALLOW_CXX_RUNTIME ON CACHE BOOL "" FORCE)
 FetchContent_Declare(
     boringssl
     GIT_REPOSITORY ${BORINGSSL_GIT_REPOSITORY}
-    GIT_TAG ${BORINGSSL_GIT_TAG}
-    GIT_SHALLOW TRUE
+    GIT_TAG        ${BORINGSSL_GIT_TAG}
+    GIT_SHALLOW    TRUE
+    PATCH_COMMAND  sh "${CMAKE_SOURCE_DIR}/patches/apply-boringssl.sh"
+                      "${CMAKE_SOURCE_DIR}/patches/boringssl-client-custom-ext.patch"
+    UPDATE_DISCONNECTED TRUE
 )
 FetchContent_MakeAvailable(boringssl)
 

@@ -19,9 +19,9 @@ struct RealityConfig {
 };
 
 // RealitySession 在普通 TCP accept 之后、TLS 之前工作。
-// 它先 peek 前 16 字节，判断是否为我们的客户端：
-//   - 是：走正常 TLS (TlsSession)
-//   - 否：透传给真实网站 (raw TCP proxy)
+// 它 peek 足够覆盖完整 ClientHello 的字节，解析其中的 TLS 扩展：
+//   - 找到并验证 REALITY_EXT_TYPE 扩展 → 移交给 TlsSession（数据留在内核缓冲区）
+//   - 未找到 → 透传给真实网站 (raw TCP proxy)
 class RealitySession : public std::enable_shared_from_this<RealitySession> {
 public:
     using CleanupCallback = std::function<void(int fd)>;
@@ -34,11 +34,12 @@ public:
     bool start();
 
 private:
-    static constexpr size_t MARKER_LEN = 16; // nonce(8) + hmac_trunc(8)
+    // peek 缓冲大小：足以覆盖任何合理的 ClientHello（含所有扩展）
+    static constexpr size_t PEEK_LEN = 1024;
     static constexpr int    TIMESTAMP_WINDOW = 30; // 秒，防重放
 
     enum class State {
-        PEEKING,        // 等待可读，peek 前 16 字节
+        PEEKING,        // 等待可读，peek ClientHello
         CONNECTING,     // 正在 connect 到真实网站
         PROXYING,       // 透传模式：client <-> real site
         DELEGATED,      // 已移交给 TlsSession
@@ -47,8 +48,6 @@ private:
 
     void on_client_readable(int fd, int events);
     void on_site_event(int fd, int events);
-
-    bool verify_marker(const uint8_t* buf);     // 验证 HMAC 标记
     bool start_proxy();                          // 连接真实网站并开始透传
     void proxy_flush_client_to_site();
     void proxy_flush_site_to_client();

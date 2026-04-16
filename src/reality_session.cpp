@@ -6,12 +6,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <cstring>
+#include <chrono>
 #include <ctime>
 #include <arpa/inet.h>
-
-// BoringSSL HMAC
-#include <openssl/hmac.h>
-#include <openssl/rand.h>
 
 // ─── 工具 ─────────────────────────────────────────────────────────────────────
 
@@ -34,22 +31,6 @@ static int tcp_connect_nb(const std::string& host, uint16_t port) {
     freeaddrinfo(res);
     if (r < 0 && errno != EINPROGRESS) { ::close(fd); return -1; }
     return fd;
-}
-
-// 计算 HMAC-SHA256(key, data)，输出截断到 out_len 字节
-static bool hmac_sha256_trunc(const std::string& key,
-                               const uint8_t* data, size_t data_len,
-                               uint8_t* out, size_t out_len) {
-    uint8_t digest[32];
-    unsigned int dlen = 0;
-    if (!HMAC(EVP_sha256(),
-              key.data(), (int)key.size(),
-              data, data_len,
-              digest, &dlen)) {
-        return false;
-    }
-    memcpy(out, digest, std::min((size_t)dlen, out_len));
-    return true;
 }
 
 // ─── RealitySession ───────────────────────────────────────────────────────────
@@ -81,9 +62,9 @@ void RealitySession::on_client_readable(int fd, int events) {
     if (state_ == State::CLOSING) return;
 
     if (state_ == State::PEEKING) {
-        uint8_t buf[MARKER_LEN];
-        // MSG_PEEK：不消耗数据
-        ssize_t n = recv(client_fd_, buf, MARKER_LEN, MSG_PEEK);
+        uint8_t buf[PEEK_LEN];
+        // MSG_PEEK：不消耗数据，ClientHello 留在内核缓冲区供后续 TLS 读取
+        ssize_t n = recv(client_fd_, buf, PEEK_LEN, MSG_PEEK);
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) return;
             state_ = State::CLOSING;
@@ -91,17 +72,16 @@ void RealitySession::on_client_readable(int fd, int events) {
         }
         if (n == 0) { state_ = State::CLOSING; do_close(); return; }
 
-        if ((size_t)n >= MARKER_LEN && verify_marker(buf)) {
-            // ── 是我们的客户端 ──────────────────────────────────────────────
-            // 先消耗掉标记字节
-            uint8_t discard[MARKER_LEN];
-            recv(client_fd_, discard, MARKER_LEN, 0);
+        // 需要至少收到完整 TLS 记录头（5 字节）才能判断
+        if ((size_t)n < 5) return;
 
+        if (reality_verify_client_hello(buf, (size_t)n, cfg_.psk, TIMESTAMP_WINDOW)) {
+            // ── 是我们的客户端 ──────────────────────────────────────────────
+            // 数据不消耗，直接交给 TlsSession，它会从 recv 读到完整 ClientHello
             PROXY_LOG_INFO("[reality] identified our client fd=" << client_fd_);
             state_ = State::DELEGATED;
             reactor_.remove(client_fd_);
 
-            // 移交给 TlsSession
             auto self = shared_from_this();
             auto cleanup = [self](int fd) {
                 PROXY_LOG_INFO("[reality] tls session closed fd=" << fd);
@@ -113,9 +93,9 @@ void RealitySession::on_client_readable(int fd, int events) {
                 ::close(client_fd_);
                 delegated_.reset();
             }
-        } else if ((size_t)n >= 1) {
+        } else {
             // ── 不是我们的客户端，透传给真实网站 ────────────────────────────
-            // 注意：数据还在 socket 缓冲区，透传时会自然读出
+            // 数据仍在内核缓冲区，透传时会自然读出（包含完整 ClientHello）
             PROXY_LOG_INFO("[reality] unknown client, proxying to "
                            << cfg_.target_host << ":" << cfg_.target_port
                            << " fd=" << client_fd_);
@@ -142,15 +122,6 @@ void RealitySession::on_client_readable(int fd, int events) {
         update_site_events();
     }
     (void)fd; (void)events;
-}
-
-// ─── HMAC 验证 ────────────────────────────────────────────────────────────────
-
-bool RealitySession::verify_marker(const uint8_t* buf) {
-    // buf[0..7] = nonce, buf[8..15] = expected HMAC truncation
-    uint8_t expected[8];
-    if (!hmac_sha256_trunc(cfg_.psk, buf, 8, expected, 8)) return false;
-    return memcmp(expected, buf + 8, 8) == 0;
 }
 
 // ─── 透传代理 ─────────────────────────────────────────────────────────────────
