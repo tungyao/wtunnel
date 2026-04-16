@@ -101,6 +101,8 @@ if(NOT WIN32)
     add_executable(qtunnel_server
         src/server.cpp
         src/tls_session.cpp
+        src/reality_session.cpp
+        src/reality_marker.cpp
         src/dns_resolver.cpp
         src/obfuscator.cpp
         ${COMMON_SOURCES}
@@ -122,6 +124,7 @@ endif()
 # ── client: cross-platform ────────────────────────────────────────────────────
 add_executable(qtunnel_client
     src/client.cpp
+    src/reality_marker.cpp
     src/obfuscator.cpp
     ${COMMON_SOURCES}
 )

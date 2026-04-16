@@ -12,6 +12,7 @@
 #include "common/reactor.h"
 #include "common/tls_wrapper.h"
 #include "common/logging.h"
+#include "reality_marker.h"
 #include <nghttp2/nghttp2.h>
 
 #ifdef _WIN32
@@ -132,9 +133,10 @@ public:
         std::function<void(uint32_t)>                   on_close;
     };
 
-    explicit TunnelConn(Reactor& reactor)
+    explicit TunnelConn(Reactor& reactor, std::string reality_psk = "")
         : reactor_(reactor), h2_(nullptr), fd_(-1)
-        , state_(State::DISCONNECTED) {}
+        , state_(State::DISCONNECTED)
+        , reality_psk_(std::move(reality_psk)) {}
 
     ~TunnelConn() { disconnect(); }
 
@@ -146,6 +148,21 @@ public:
         if (fd_ < 0) {
             PROXY_LOG_ERROR("[tunnel] TCP connect failed to " << host << ":" << port);
             return false;
+        }
+
+        // REALITY 模式：TLS 握手前先发送身份标记
+        if (!reality_psk_.empty()) {
+            uint8_t marker[16];
+            if (!reality_make_marker(reality_psk_, marker)) {
+                PROXY_LOG_ERROR("[tunnel] Failed to generate reality marker");
+                close_fd(fd_); fd_ = -1; return false;
+            }
+            ssize_t sent = sock_send(fd_, marker, sizeof(marker), 0);
+            if (sent != (ssize_t)sizeof(marker)) {
+                PROXY_LOG_ERROR("[tunnel] Failed to send reality marker");
+                close_fd(fd_); fd_ = -1; return false;
+            }
+            PROXY_LOG_INFO("[tunnel] REALITY marker sent");
         }
 
         // TLS with Chrome fingerprint
@@ -484,9 +501,13 @@ private:
             if (it != self->streams_.end() && it->second.tunnel_ready) {
                 PROXY_LOG_INFO("[tunnel] Stream " << sid << " tunnel ready");
                 if (it->second.cbs.on_ready) it->second.cbs.on_ready();
-                // Flush any data buffered before tunnel was ready
+                // flush_pre_buf only submits to nghttp2 queue; the actual send
+                // happens in on_fd_event's flush_h2() after mem_recv returns.
+                // Do NOT call flush_h2() / nghttp2_session_send() here — calling
+                // it from within an nghttp2 callback causes re-entrancy and
+                // results in the session silently stalling.
                 self->flush_pre_buf(sid);
-                self->flush_h2();
+                self->update_reactor(); // ensure tunnel fd is armed for WRITABLE
             }
         }
 
@@ -554,6 +575,7 @@ private:
     int            fd_;
     State          state_;
     std::string    server_host_;
+    std::string    reality_psk_;
     std::deque<uint8_t> write_buf_;
     std::unordered_map<int32_t, StreamState> streams_;
 };
@@ -748,16 +770,18 @@ private:
 class ProxyServer {
 public:
     ProxyServer(uint16_t local_port,
-                const std::string& tunnel_host, uint16_t tunnel_port)
+                const std::string& tunnel_host, uint16_t tunnel_port,
+                std::string reality_psk = "")
         : local_port_(local_port)
         , tunnel_host_(tunnel_host)
-        , tunnel_port_(tunnel_port) {}
+        , tunnel_port_(tunnel_port)
+        , reality_psk_(std::move(reality_psk)) {}
 
     bool run() {
         if (!reactor_.init()) return false;
 
         // Connect tunnel
-        tunnel_ = std::make_shared<TunnelConn>(reactor_);
+        tunnel_ = std::make_shared<TunnelConn>(reactor_, reality_psk_);
         if (!tunnel_->connect(tunnel_host_, tunnel_port_)) {
             PROXY_LOG_ERROR("[proxy] Failed to connect to tunnel server");
             return false;
@@ -823,6 +847,7 @@ private:
     uint16_t    local_port_;
     std::string tunnel_host_;
     uint16_t    tunnel_port_;
+    std::string reality_psk_;
     int         listen_fd_ = -1;
     Reactor     reactor_;
     std::shared_ptr<TunnelConn> tunnel_;
@@ -840,10 +865,11 @@ static void print_usage(const char* prog) {
         "  -p <port>   Local HTTP proxy listen port (default: 8080)\n"
         "  -H <host>   Tunnel server host           (default: 127.0.0.1)\n"
         "  -P <port>   Tunnel server port           (default: 8443)\n"
+        "  -K <psk>    REALITY pre-shared key       (must match server -K)\n"
         "  -h          Show this help message\n"
         "\n"
         "Example:\n"
-        "  %s -p 8080 -H tunnel.example.com -P 8443\n",
+        "  %s -p 8080 -H tunnel.example.com -P 443 -K mysecret\n",
         prog, prog);
 }
 
@@ -858,13 +884,15 @@ int main(int argc, char* argv[]) {
     uint16_t    local_port   = 8080;
     std::string tunnel_host  = "127.0.0.1";
     uint16_t    tunnel_port  = 8443;
+    std::string reality_psk;
 
     int opt;
-    while ((opt = getopt(argc, argv, "p:H:P:h")) != -1) {
+    while ((opt = getopt(argc, argv, "p:H:P:K:h")) != -1) {
         switch (opt) {
         case 'p': local_port  = (uint16_t)std::stoi(optarg); break;
         case 'H': tunnel_host = optarg;                       break;
         case 'P': tunnel_port = (uint16_t)std::stoi(optarg); break;
+        case 'K': reality_psk = optarg;                       break;
         case 'h': print_usage(argv[0]); return 0;
         default:  print_usage(argv[0]); return 1;
         }
@@ -873,8 +901,10 @@ int main(int argc, char* argv[]) {
     PROXY_LOG_INFO("[main] Starting wtunnel client");
     PROXY_LOG_INFO("[main] Local proxy  : 127.0.0.1:" << local_port);
     PROXY_LOG_INFO("[main] Tunnel server: " << tunnel_host << ":" << tunnel_port);
+    if (!reality_psk.empty())
+        PROXY_LOG_INFO("[main] REALITY mode  : enabled");
 
-    ProxyServer proxy(local_port, tunnel_host, tunnel_port);
+    ProxyServer proxy(local_port, tunnel_host, tunnel_port, reality_psk);
     proxy.run();
     return 0;
 }

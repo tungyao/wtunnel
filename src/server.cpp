@@ -2,6 +2,7 @@
 #include "common/tls_wrapper.h"
 #include "common/logging.h"
 #include "tls_session.h"
+#include "reality_session.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -14,8 +15,9 @@
 
 class SimpleTlsServer {
 public:
-    SimpleTlsServer(uint16_t port, const std::string& bind_addr)
-        : port_(port), bind_addr_(bind_addr) {}
+    SimpleTlsServer(uint16_t port, const std::string& bind_addr,
+                    RealityConfig reality = {})
+        : port_(port), bind_addr_(bind_addr), reality_(std::move(reality)) {}
 
 
     
@@ -67,19 +69,31 @@ private:
 
         set_nonblocking(client_fd);
 
-        // cleanup callback：session 关闭时从 map 中移除，shared_ptr 引用归零后析构
+        // cleanup callback：session 关闭时从 map 中移除
         auto cleanup = [this](int fd) {
             PROXY_LOG_INFO("[server] session closed fd=" << fd);
             sessions_.erase(fd);
+            reality_sessions_.erase(fd);
         };
 
-        auto session = std::make_shared<TlsSession>(client_fd, reactor_, tls_ctx_, cleanup);
-
-        if (!session->start_server()) {
-            // start_server 失败时 tls_sock_ 未持有 fd，需要手动关闭
-            ::close(client_fd);
+        if (!reality_.psk.empty()) {
+            // REALITY 模式：先探测客户端身份
+            auto rsession = std::make_shared<RealitySession>(
+                client_fd, reactor_, tls_ctx_, reality_, cleanup);
+            if (!rsession->start()) {
+                ::close(client_fd);
+            } else {
+                reality_sessions_[client_fd] = std::move(rsession);
+            }
         } else {
-            sessions_[client_fd] = std::move(session);
+            // 普通 TLS 模式
+            auto session = std::make_shared<TlsSession>(
+                client_fd, reactor_, tls_ctx_, cleanup);
+            if (!session->start_server()) {
+                ::close(client_fd);
+            } else {
+                sessions_[client_fd] = std::move(session);
+            }
         }
     }
 
@@ -90,9 +104,11 @@ private:
 
     uint16_t    port_;
     std::string bind_addr_;
+    RealityConfig reality_;
     Reactor reactor_;
     TlsContext tls_ctx_;
-    std::unordered_map<int, std::shared_ptr<TlsSession>> sessions_;
+    std::unordered_map<int, std::shared_ptr<TlsSession>>    sessions_;
+    std::unordered_map<int, std::shared_ptr<RealitySession>> reality_sessions_;
 };
 
 static void print_usage(const char* prog) {
@@ -100,12 +116,19 @@ static void print_usage(const char* prog) {
         "Usage: %s [options]\n"
         "\n"
         "Options:\n"
-        "  -p <port>   Listen port         (default: 8443)\n"
-        "  -b <addr>   Bind address        (default: 0.0.0.0)\n"
-        "  -h          Show this help message\n"
+        "  -p <port>         Listen port              (default: 8443)\n"
+        "  -b <addr>         Bind address             (default: 0.0.0.0)\n"
+        "  -R <host[:port]>  REALITY: real site target (e.g. www.microsoft.com)\n"
+        "  -K <psk>          REALITY: pre-shared key for client auth\n"
+        "  -h                Show this help message\n"
+        "\n"
+        "REALITY mode (both -R and -K required):\n"
+        "  Verified clients get a normal TLS tunnel.\n"
+        "  All other connections are transparently proxied to the real site,\n"
+        "  so scanners see the real site's certificate.\n"
         "\n"
         "Example:\n"
-        "  %s -p 8443 -b 0.0.0.0\n",
+        "  %s -p 443 -R www.microsoft.com -K mysecret\n",
         prog, prog);
 }
 
@@ -114,18 +137,38 @@ int main(int argc, char* argv[]) {
 
     uint16_t    port       = 8443;
     std::string bind_addr  = "0.0.0.0";
+    RealityConfig reality;
 
     int opt;
-    while ((opt = getopt(argc, argv, "p:b:h")) != -1) {
+    while ((opt = getopt(argc, argv, "p:b:R:K:h")) != -1) {
         switch (opt) {
-        case 'p': port      = (uint16_t)std::stoi(optarg); break;
-        case 'b': bind_addr = optarg;                       break;
+        case 'p': port             = (uint16_t)std::stoi(optarg); break;
+        case 'b': bind_addr        = optarg;                       break;
+        case 'K': reality.psk      = optarg;                       break;
+        case 'R': {
+            // 解析 host 或 host:port
+            std::string s = optarg;
+            auto col = s.rfind(':');
+            if (col != std::string::npos) {
+                reality.target_host = s.substr(0, col);
+                reality.target_port = (uint16_t)std::stoi(s.substr(col + 1));
+            } else {
+                reality.target_host = s;
+                reality.target_port = 443;
+            }
+            break;
+        }
         case 'h': print_usage(argv[0]); return 0;
         default:  print_usage(argv[0]); return 1;
         }
     }
 
-    SimpleTlsServer server(port, bind_addr);
+    if (!reality.psk.empty() && reality.target_host.empty()) {
+        fprintf(stderr, "Error: -K requires -R <target_host>\n");
+        return 1;
+    }
+
+    SimpleTlsServer server(port, bind_addr, std::move(reality));
     server.run();
     return 0;
 }
