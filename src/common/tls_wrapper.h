@@ -5,6 +5,7 @@
 #include <memory>
 #include <cstring>
 #include "posix_compat.h"
+#include "chrome_fingerprint.h"
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/bio.h>
@@ -45,7 +46,10 @@ public:
                      const std::string& key_path = "");
     bool init_client();
     
+    // Built-in Chrome 146 preset (no fingerprint file required).
     void configure_chrome_fingerprint();
+    // Apply a parsed Wireshark fingerprint. Pass nullptr to use the built-in preset.
+    void configure_chrome_fingerprint(const ChromeFingerprint* fp);
     void set_alpn(const std::vector<std::string>& protocols);
     
     SSL_CTX* ctx() const { return ctx_; }

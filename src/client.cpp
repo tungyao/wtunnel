@@ -11,6 +11,7 @@
 
 #include "common/reactor.h"
 #include "common/tls_wrapper.h"
+#include "common/chrome_fingerprint.h"
 #include "common/logging.h"
 #include "reality_marker.h"
 #include <nghttp2/nghttp2.h>
@@ -133,10 +134,12 @@ public:
         std::function<void(uint32_t)>                   on_close;
     };
 
-    explicit TunnelConn(Reactor& reactor, std::string reality_psk = "")
+    explicit TunnelConn(Reactor& reactor, std::string reality_psk = "",
+                        std::string fingerprint_path = "")
         : reactor_(reactor), h2_(nullptr), fd_(-1)
         , state_(State::DISCONNECTED)
-        , reality_psk_(std::move(reality_psk)) {}
+        , reality_psk_(std::move(reality_psk))
+        , fingerprint_path_(std::move(fingerprint_path)) {}
 
     ~TunnelConn() { disconnect(); }
 
@@ -153,7 +156,19 @@ public:
         // TLS with Chrome fingerprint
         if (!tls_ctx_.init_client()) return false;
         SSL_CTX_set_verify(tls_ctx_.ctx(), SSL_VERIFY_NONE, nullptr);
-        tls_ctx_.configure_chrome_fingerprint();
+
+        if (!fingerprint_path_.empty()) {
+            ChromeFingerprint fp;
+            if (ChromeFingerprint::parse_wireshark(fingerprint_path_, fp)) {
+                PROXY_LOG_INFO("[tunnel] Loaded fingerprint from " << fingerprint_path_);
+                tls_ctx_.configure_chrome_fingerprint(&fp);
+            } else {
+                PROXY_LOG_ERROR("[tunnel] Failed to parse fingerprint file, using built-in preset");
+                tls_ctx_.configure_chrome_fingerprint();
+            }
+        } else {
+            tls_ctx_.configure_chrome_fingerprint();
+        }
         tls_ctx_.set_alpn({"h2", "http/1.1"});
 
         // REALITY 模式：在 ClientHello 扩展里嵌入身份标记
@@ -568,6 +583,7 @@ private:
     State          state_;
     std::string    server_host_;
     std::string    reality_psk_;
+    std::string    fingerprint_path_;
     std::deque<uint8_t> write_buf_;
     std::unordered_map<int32_t, StreamState> streams_;
 };
@@ -763,17 +779,19 @@ class ProxyServer {
 public:
     ProxyServer(uint16_t local_port,
                 const std::string& tunnel_host, uint16_t tunnel_port,
-                std::string reality_psk = "")
+                std::string reality_psk = "",
+                std::string fingerprint_path = "")
         : local_port_(local_port)
         , tunnel_host_(tunnel_host)
         , tunnel_port_(tunnel_port)
-        , reality_psk_(std::move(reality_psk)) {}
+        , reality_psk_(std::move(reality_psk))
+        , fingerprint_path_(std::move(fingerprint_path)) {}
 
     bool run() {
         if (!reactor_.init()) return false;
 
         // Connect tunnel
-        tunnel_ = std::make_shared<TunnelConn>(reactor_, reality_psk_);
+        tunnel_ = std::make_shared<TunnelConn>(reactor_, reality_psk_, fingerprint_path_);
         if (!tunnel_->connect(tunnel_host_, tunnel_port_)) {
             PROXY_LOG_ERROR("[proxy] Failed to connect to tunnel server");
             return false;
@@ -840,6 +858,7 @@ private:
     std::string tunnel_host_;
     uint16_t    tunnel_port_;
     std::string reality_psk_;
+    std::string fingerprint_path_;
     int         listen_fd_ = -1;
     Reactor     reactor_;
     std::shared_ptr<TunnelConn> tunnel_;
@@ -858,10 +877,11 @@ static void print_usage(const char* prog) {
         "  -H <host>   Tunnel server host           (default: 127.0.0.1)\n"
         "  -P <port>   Tunnel server port           (default: 8443)\n"
         "  -K <psk>    REALITY pre-shared key       (must match server -K)\n"
+        "  -F <file>   Wireshark Client Hello text dump for TLS fingerprint\n"
         "  -h          Show this help message\n"
         "\n"
         "Example:\n"
-        "  %s -p 8080 -H tunnel.example.com -P 443 -K mysecret\n",
+        "  %s -p 8080 -H tunnel.example.com -P 443 -K mysecret -F chrome146.txt\n",
         prog, prog);
 }
 
@@ -873,18 +893,20 @@ int main(int argc, char* argv[]) {
     signal(SIGPIPE, SIG_IGN);
 #endif
 
-    uint16_t    local_port   = 8080;
-    std::string tunnel_host  = "127.0.0.1";
-    uint16_t    tunnel_port  = 8443;
+    uint16_t    local_port       = 8080;
+    std::string tunnel_host      = "127.0.0.1";
+    uint16_t    tunnel_port      = 8443;
     std::string reality_psk;
+    std::string fingerprint_path;
 
     int opt;
-    while ((opt = getopt(argc, argv, "p:H:P:K:h")) != -1) {
+    while ((opt = getopt(argc, argv, "p:H:P:K:F:h")) != -1) {
         switch (opt) {
-        case 'p': local_port  = (uint16_t)std::stoi(optarg); break;
-        case 'H': tunnel_host = optarg;                       break;
-        case 'P': tunnel_port = (uint16_t)std::stoi(optarg); break;
-        case 'K': reality_psk = optarg;                       break;
+        case 'p': local_port       = (uint16_t)std::stoi(optarg); break;
+        case 'H': tunnel_host      = optarg;                       break;
+        case 'P': tunnel_port      = (uint16_t)std::stoi(optarg); break;
+        case 'K': reality_psk      = optarg;                       break;
+        case 'F': fingerprint_path = optarg;                       break;
         case 'h': print_usage(argv[0]); return 0;
         default:  print_usage(argv[0]); return 1;
         }
@@ -896,7 +918,7 @@ int main(int argc, char* argv[]) {
     if (!reality_psk.empty())
         PROXY_LOG_INFO("[main] REALITY mode  : enabled");
 
-    ProxyServer proxy(local_port, tunnel_host, tunnel_port, reality_psk);
+    ProxyServer proxy(local_port, tunnel_host, tunnel_port, reality_psk, fingerprint_path);
     proxy.run();
     return 0;
 }

@@ -33,7 +33,7 @@ FetchContent_Declare(
     GIT_TAG        ${BORINGSSL_GIT_TAG}
     GIT_SHALLOW    TRUE
     PATCH_COMMAND  sh "${CMAKE_SOURCE_DIR}/patches/apply-boringssl.sh"
-                      "${CMAKE_SOURCE_DIR}/patches/boringssl-client-custom-ext.patch"
+                      "${CMAKE_SOURCE_DIR}/patches/boringssl-chrome.patch"
     UPDATE_DISCONNECTED TRUE
 )
 FetchContent_MakeAvailable(boringssl)
@@ -83,6 +83,7 @@ set(COMMON_SOURCES
     src/common/reactor.cpp
     src/common/buffer_pool.cpp
     src/common/tls_wrapper.cpp
+    src/common/chrome_fingerprint.cpp
 )
 
 add_library(proxy_tls_ssl INTERFACE)
