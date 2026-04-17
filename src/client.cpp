@@ -6,7 +6,10 @@
  *                              └──TLS(Chrome fingerprint)+H2 CONNECT──> TunnelServer :8443
  *                                                                            └──TCP──> Target
  *
- * Multiplexing: one persistent TLS+H2 connection to the server, one H2 stream per CONNECT.
+ * Connection model: one short-lived TLS+H2 connection per browser CONNECT request.
+ * TLS 1.3 session tickets are cached so subsequent connections use 0-RTT resumption:
+ * the H2 connection preface is sent in the first TLS flight, and the server can
+ * start processing the CONNECT before the handshake completes.
  */
 
 #include "common/reactor.h"
@@ -18,7 +21,6 @@
 
 #ifdef _WIN32
 #  include "common/posix_compat.h"
-   // getopt is not available on MSVC; use a minimal inline implementation
    static int   optind_w = 1;
    static char* optarg_w = nullptr;
 #  define optind optind_w
@@ -73,7 +75,7 @@ static void set_nonblocking(int fd) {
 
 static void close_fd(int fd) {
 #ifdef _WIN32
-    close(fd);   // posix_compat::close via posix_compat.h
+    close(fd);
 #else
     ::close(fd);
 #endif
@@ -95,7 +97,8 @@ static ssize_t sock_send(int fd, const void* buf, size_t len, int flags) {
 #endif
 }
 
-static int tcp_connect(const std::string& host, uint16_t port) {
+// Non-blocking TCP connect (returns fd in EINPROGRESS state).
+static int tcp_connect_nb(const std::string& host, uint16_t port) {
     struct addrinfo hints{}, *res = nullptr;
     hints.ai_family   = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -106,32 +109,64 @@ static int tcp_connect(const std::string& host, uint16_t port) {
     }
 #ifdef _WIN32
     int fd = posix_compat::socket_fd(res->ai_family, SOCK_STREAM, 0);
-    if (fd < 0) { freeaddrinfo(res); return -1; }
-    if (posix_compat::connect_fd(fd, res->ai_addr, (socklen_t)res->ai_addrlen) < 0) {
 #else
     int fd = (int)socket(res->ai_family, SOCK_STREAM, 0);
-    if (fd < 0) { freeaddrinfo(res); return -1; }
-    if (::connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
 #endif
-        freeaddrinfo(res);
-        close_fd(fd);
-        return -1;
-    }
+    if (fd < 0) { freeaddrinfo(res); return -1; }
+    set_nonblocking(fd);
+#ifdef _WIN32
+    int r = posix_compat::connect_fd(fd, res->ai_addr, (socklen_t)res->ai_addrlen);
+#else
+    int r = ::connect(fd, res->ai_addr, res->ai_addrlen);
+#endif
     freeaddrinfo(res);
+    if (r < 0 && errno != EINPROGRESS) { close_fd(fd); return -1; }
     return fd;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// TunnelConn — one TLS+H2 connection to the tunnel server
-//              multiplexes multiple streams (one per browser CONNECT)
+// SessionCache — one cached TLS session ticket shared across all LocalSessions
+// ─────────────────────────────────────────────────────────────────────────────
+struct SessionCache {
+    SSL_SESSION* sess = nullptr;
+
+    ~SessionCache() { if (sess) SSL_SESSION_free(sess); }
+
+    SSL_SESSION* get() const { return sess; }
+
+    // Takes ownership of s (caller must have called SSL_SESSION_up_ref).
+    void update(SSL_SESSION* s) {
+        if (sess) SSL_SESSION_free(sess);
+        sess = s;
+    }
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TunnelConfig — immutable per-server settings passed into each LocalSession
+// ─────────────────────────────────────────────────────────────────────────────
+struct TunnelConfig {
+    std::string host;
+    uint16_t    port            = 8443;
+    std::string reality_psk;
+    std::string fingerprint_path;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TunnelConn — one short-lived TLS+H2 connection to the tunnel server.
+//
+// Lifecycle: start_connect() → [TCP_CONNECTING → TLS_HANDSHAKING] → CONNECTED
+//            → one or more open_stream() calls → disconnect() on last stream close.
+//
+// 0-RTT: if a session ticket is supplied and the server supports early data,
+// the 24-byte H2 connection preface is sent in the first TLS flight so the
+// server can start processing the CONNECT before the handshake finishes.
 // ─────────────────────────────────────────────────────────────────────────────
 class TunnelConn : public std::enable_shared_from_this<TunnelConn> {
 public:
-    // Callbacks per stream
     struct StreamCbs {
-        std::function<void()>                           on_ready;   // received 200
-        std::function<void(const uint8_t*, size_t)>     on_data;
-        std::function<void(uint32_t)>                   on_close;
+        std::function<void()>                       on_ready;
+        std::function<void(const uint8_t*, size_t)> on_data;
+        std::function<void(uint32_t)>               on_close;
     };
 
     explicit TunnelConn(Reactor& reactor, std::string reality_psk = "",
@@ -139,150 +174,68 @@ public:
         : reactor_(reactor), h2_(nullptr), fd_(-1)
         , state_(State::DISCONNECTED)
         , reality_psk_(std::move(reality_psk))
-        , fingerprint_path_(std::move(fingerprint_path)) {}
+        , fingerprint_path_(std::move(fingerprint_path))
+        , pending_session_(nullptr)
+        , early_data_attempted_(false)
+        , skip_h2_preface_(false) {}
 
     ~TunnelConn() { disconnect(); }
 
-    // Connect to server and perform TLS+H2 handshake (blocking for simplicity)
-    bool connect(const std::string& host, uint16_t port) {
-        server_host_ = host;
+    // Async connect. on_ready(true) → connected; on_ready(false) → failed.
+    // session: borrowed reference; TunnelConn does NOT free it.
+    bool start_connect(const std::string& host, uint16_t port,
+                       SSL_SESSION* session,
+                       std::function<void(bool)> on_ready) {
+        server_host_     = host;
+        pending_session_ = session;
+        on_connected_    = std::move(on_ready);
+        early_data_attempted_ = false;
+        skip_h2_preface_      = false;
 
-        fd_ = tcp_connect(host, port);
+        fd_ = tcp_connect_nb(host, port);
         if (fd_ < 0) {
-            PROXY_LOG_ERROR("[tunnel] TCP connect failed to " << host << ":" << port);
+            PROXY_LOG_ERROR("[tunnel] tcp_connect_nb failed to " << host << ":" << port);
             return false;
         }
 
-        // TLS with Chrome fingerprint
-        if (!tls_ctx_.init_client()) return false;
-        SSL_CTX_set_verify(tls_ctx_.ctx(), SSL_VERIFY_NONE, nullptr);
-
-        if (!fingerprint_path_.empty()) {
-            ChromeFingerprint fp;
-            if (ChromeFingerprint::parse_wireshark(fingerprint_path_, fp)) {
-                PROXY_LOG_INFO("[tunnel] Loaded fingerprint from " << fingerprint_path_);
-                tls_ctx_.configure_chrome_fingerprint(&fp);
-            } else {
-                PROXY_LOG_ERROR("[tunnel] Failed to parse fingerprint file, using built-in preset");
-                tls_ctx_.configure_chrome_fingerprint();
-            }
-        } else {
-            tls_ctx_.configure_chrome_fingerprint();
-        }
-        tls_ctx_.set_alpn({"h2", "http/1.1"});
-
-        // REALITY 模式：在 ClientHello 扩展里嵌入身份标记
-        if (!reality_psk_.empty()) {
-            tls_ctx_.enable_reality_bind_client();
-            tls_sock_.set_reality_bind(reality_psk_);
-            PROXY_LOG_INFO("[tunnel] REALITY bind configured (ClientHello extension)");
-        }
-
-        if (!tls_sock_.connect(fd_, tls_ctx_, host)) {
-            PROXY_LOG_ERROR("[tunnel] TLS connect initiation failed");
-            close_fd(fd_);
-            fd_ = -1;
-            return false;
-        }
-
-        // Blocking TLS handshake
-        while (!tls_sock_.is_connected()) {
-            if (!tls_sock_.continue_handshake()) {
-                PROXY_LOG_ERROR("[tunnel] TLS handshake failed");
-                close_fd(fd_);
-                fd_ = -1;
-                return false;
-            }
-            if (!tls_sock_.is_connected()) {
-                // wait for socket readiness (simple blocking poll)
-                fd_set rset, wset;
-                FD_ZERO(&rset); FD_ZERO(&wset);
-                if (tls_sock_.want_read())  FD_SET(fd_, &rset);
-                if (tls_sock_.want_write()) FD_SET(fd_, &wset);
-                select(fd_ + 1, &rset, &wset, nullptr, nullptr);
-            }
-        }
-
-        auto info = tls_sock_.get_tls_info();
-        PROXY_LOG_INFO("[tunnel] TLS handshake done. version=" << info.version
-                       << " cipher=" << info.cipher << " alpn=" << info.alpn);
-
-        // When chrome_fingerprint_mode suppresses the ALPN extension, the server
-        // won't echo ALPN back; both sides still use h2 directly.
-        if (!info.alpn.empty() && info.alpn != "h2") {
-            PROXY_LOG_ERROR("[tunnel] Server did not negotiate h2 (got: " << info.alpn << ")");
-            disconnect();
-            return false;
-        }
-
-        // Initialize nghttp2 client session
-        nghttp2_session_callbacks* cbs;
-        nghttp2_session_callbacks_new(&cbs);
-        nghttp2_session_callbacks_set_send_callback(cbs, on_send_cb);
-        nghttp2_session_callbacks_set_on_frame_recv_callback(cbs, on_frame_recv_cb);
-        nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cbs, on_data_chunk_cb);
-        nghttp2_session_callbacks_set_on_stream_close_callback(cbs, on_stream_close_cb);
-        nghttp2_session_callbacks_set_on_header_callback(cbs, on_header_cb);
-        int rv = nghttp2_session_client_new(&h2_, cbs, this);
-        nghttp2_session_callbacks_del(cbs);
-        if (rv != 0) {
-            PROXY_LOG_ERROR("[tunnel] nghttp2_session_client_new failed: " << nghttp2_strerror(rv));
-            disconnect();
-            return false;
-        }
-
-        // Send client preface + initial SETTINGS
-        nghttp2_settings_entry settings[] = {
-            { NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 100 },
-            { NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE,    1 << 20 },  // 1 MB stream window
-        };
-        nghttp2_submit_settings(h2_, NGHTTP2_FLAG_NONE, settings, 2);
-        // Also expand the connection-level flow-control window
-        nghttp2_submit_window_update(h2_, NGHTTP2_FLAG_NONE, 0, (1 << 20) - 65535);
-        flush_h2();
-
-        state_ = State::CONNECTED;
-        set_nonblocking(fd_);
-
-        // Register with reactor
+        state_ = State::TCP_CONNECTING;
         auto self = shared_from_this();
-        reactor_.add(fd_, Event::READABLE | Event::WRITABLE,
+        reactor_.add(fd_, Event::WRITABLE,
                      [self](int fd, int ev) { self->on_fd_event(fd, ev); });
-
-        PROXY_LOG_INFO("[tunnel] Connected and H2 session established");
         return true;
     }
 
-    // Open HTTP/2 CONNECT tunnel (RFC 7540 §8.3)
+    // After a successful connection, returns a new reference to the session ticket
+    // (caller must SSL_SESSION_free when done).
+    SSL_SESSION* take_session() {
+        SSL_SESSION* s = tls_sock_.get_session();
+        if (s) SSL_SESSION_up_ref(s);
+        return s;
+    }
+
+    // Open HTTP/2 CONNECT tunnel (RFC 7540 §8.3).
     int32_t open_stream(const std::string& target_host, uint16_t target_port, StreamCbs cbs) {
         if (state_ != State::CONNECTED) return -1;
 
         std::string authority = target_host + ":" + std::to_string(target_port);
-        nghttp2_nv headers[] = {
-            { (uint8_t*)":method",    (uint8_t*)"CONNECT",         7,                    authority.size(), NGHTTP2_NV_FLAG_NONE },
-            { (uint8_t*)":authority", (uint8_t*)authority.c_str(), 10,                   authority.size(), NGHTTP2_NV_FLAG_NONE },
-        };
-        // Correct lengths
-        headers[0].namelen  = 7;
-        headers[0].valuelen = 7; // "CONNECT"
-        headers[1].namelen  = 10;
-        headers[1].valuelen = authority.size();
+        nghttp2_nv headers[2];
+        headers[0] = { (uint8_t*)":method",    (uint8_t*)"CONNECT",         7, 7,                    NGHTTP2_NV_FLAG_NONE };
+        headers[1] = { (uint8_t*)":authority", (uint8_t*)authority.c_str(), 10, authority.size(), NGHTTP2_NV_FLAG_NONE };
 
         int32_t sid = nghttp2_submit_headers(h2_, NGHTTP2_FLAG_NONE, -1, nullptr,
                                              headers, 2, nullptr);
         if (sid < 0) {
-            PROXY_LOG_ERROR("[tunnel] nghttp2_submit_headers failed: " << nghttp2_strerror(sid));
+            PROXY_LOG_ERROR("[tunnel] nghttp2_submit_headers: " << nghttp2_strerror(sid));
             return -1;
         }
 
-        streams_[sid] = StreamState{ std::move(cbs), false, {}, false };
+        streams_[sid] = StreamState{ std::move(cbs), false, {}, false, nullptr };
         flush_h2();
         update_reactor();
-        PROXY_LOG_INFO("[tunnel] Opened H2 CONNECT stream " << sid << " -> " << authority);
+        PROXY_LOG_INFO("[tunnel] Opened H2 stream " << sid << " -> " << authority);
         return sid;
     }
 
-    // Send data on a stream — uses a persistent per-stream data source
     void send_stream_data(int32_t sid, const uint8_t* data, size_t len, bool eof = false) {
         if (state_ != State::CONNECTED) return;
         auto it = streams_.find(sid);
@@ -290,110 +243,139 @@ public:
         StreamState& ss = it->second;
 
         if (!ss.tunnel_ready) {
-            // Buffer until 200 arrives
-            if (data && len > 0)
-                ss.pre_buf.insert(ss.pre_buf.end(), data, data + len);
+            if (data && len > 0) ss.pre_buf.insert(ss.pre_buf.end(), data, data + len);
             if (eof) ss.pre_eof = true;
             return;
         }
-
         feed_data_src(sid, ss, data, len, eof);
         flush_h2();
         update_reactor();
     }
 
-    void close_stream(int32_t sid) {
-        send_stream_data(sid, nullptr, 0, /*eof=*/true);
-    }
+    void close_stream(int32_t sid) { send_stream_data(sid, nullptr, 0, true); }
 
     bool is_connected() const { return state_ == State::CONNECTED; }
 
 private:
-    enum class State { DISCONNECTED, CONNECTED };
+    enum class State { DISCONNECTED, TCP_CONNECTING, TLS_HANDSHAKING, CONNECTED };
 
-    // Persistent data source — shared between TunnelConn and nghttp2
     struct DataSrc {
         std::deque<std::vector<uint8_t>> chunks;
-        bool eof = false;
-        bool submitted = false;  // true after nghttp2_submit_data has been called once
+        bool eof       = false;
+        bool submitted = false;
     };
 
     struct StreamState {
         StreamCbs            cbs;
         bool                 tunnel_ready = false;
-        std::vector<uint8_t> pre_buf;     // data buffered before tunnel_ready
+        std::vector<uint8_t> pre_buf;
         bool                 pre_eof      = false;
         DataSrc*             data_src     = nullptr;
     };
 
-    static ssize_t stream_data_read_cb(nghttp2_session* /*session*/, int32_t /*sid*/,
-                                        uint8_t* buf, size_t cap, uint32_t* flags,
-                                        nghttp2_data_source* ds, void* /*ud*/) {
-        auto* src = static_cast<DataSrc*>(ds->ptr);
-        if (src->chunks.empty()) {
-            if (src->eof) {
-                *flags |= NGHTTP2_DATA_FLAG_EOF;
-                delete src;
-                ds->ptr = nullptr;
-                return 0;
-            }
-            return NGHTTP2_ERR_DEFERRED;
+    // ── Connection state machine ─────────────────────────────────────────────
+
+    void on_fd_event(int fd, int events) {
+        switch (state_) {
+        case State::TCP_CONNECTING:  handle_tcp_connect(events);  break;
+        case State::TLS_HANDSHAKING: handle_tls_handshake(events); break;
+        case State::CONNECTED:       handle_data(fd, events);      break;
+        default: break;
         }
-        auto& chunk = src->chunks.front();
-        size_t n = std::min(chunk.size(), cap);
-        memcpy(buf, chunk.data(), n);
-        chunk.erase(chunk.begin(), chunk.begin() + n);
-        if (chunk.empty()) src->chunks.pop_front();
-        return (ssize_t)n;
     }
 
-    // Add data to the per-stream data source; submit or resume as needed
-    void feed_data_src(int32_t sid, StreamState& ss,
-                        const uint8_t* data, size_t len, bool eof) {
-        if (!ss.data_src) {
-            ss.data_src = new DataSrc();
-        }
-        if (data && len > 0)
-            ss.data_src->chunks.push_back(std::vector<uint8_t>(data, data + len));
-        if (eof) ss.data_src->eof = true;
+    void handle_tcp_connect(int events) {
+        if (!(events & Event::WRITABLE)) return;
 
-        // If provider not yet submitted, submit it; otherwise resume it
-        // We track submission by the pointer being non-null in streams_
-        // Re-submit check: a deferred provider is still the active one; just resume.
-        // We use a simple convention: data_src != null means the provider IS active.
-        // Submit only once (first call); all subsequent calls just resume.
-        if (!ss.data_src->submitted) {
-            ss.data_src->submitted = true;
-            nghttp2_data_provider prov;
-            prov.source.ptr = ss.data_src;
-            prov.read_callback = stream_data_read_cb;
-            int rv = nghttp2_submit_data(h2_, NGHTTP2_FLAG_NONE, sid, &prov);
-            if (rv != 0) {
-                PROXY_LOG_ERROR("[tunnel] nghttp2_submit_data failed: " << nghttp2_strerror(rv));
+        int err = 0; socklen_t len = sizeof(err);
+        getsockopt(fd_, SOL_SOCKET, SO_ERROR, &err, &len);
+        if (err != 0) {
+            PROXY_LOG_ERROR("[tunnel] TCP connect failed: " << strerror(err));
+            on_connect_fail(); return;
+        }
+
+        // TCP connected — set up TLS.
+        if (!tls_ctx_.init_client()) { on_connect_fail(); return; }
+        SSL_CTX_set_verify(tls_ctx_.ctx(), SSL_VERIFY_NONE, nullptr);
+        tls_ctx_.enable_early_data();
+
+        if (!fingerprint_path_.empty()) {
+            ChromeFingerprint fp;
+            if (ChromeFingerprint::parse_wireshark(fingerprint_path_, fp)) {
+                PROXY_LOG_INFO("[tunnel] Loaded fingerprint from " << fingerprint_path_);
+                tls_ctx_.configure_chrome_fingerprint(&fp);
+            } else {
+                PROXY_LOG_ERROR("[tunnel] Bad fingerprint file, using built-in preset");
+                tls_ctx_.configure_chrome_fingerprint();
             }
         } else {
-            nghttp2_session_resume_data(h2_, sid);
+            tls_ctx_.configure_chrome_fingerprint();
         }
+        tls_ctx_.set_alpn({"h2", "http/1.1"});
+
+        if (!reality_psk_.empty()) {
+            tls_ctx_.enable_reality_bind_client();
+            tls_sock_.set_reality_bind(reality_psk_);
+            PROXY_LOG_INFO("[tunnel] REALITY bind configured");
+        }
+
+        if (!tls_sock_.connect(fd_, tls_ctx_, server_host_, pending_session_)) {
+            PROXY_LOG_ERROR("[tunnel] TLS connect initiation failed");
+            on_connect_fail(); return;
+        }
+
+        state_ = State::TLS_HANDSHAKING;
+
+        // In BoringSSL, SSL_in_early_data() may become true immediately after
+        // SSL_connect() if the session is 0-RTT capable.  Try to send the H2
+        // connection preface now; if not yet in the early-data window the call
+        // is a no-op and we retry in handle_tls_handshake().
+        try_send_h2_early_data();
+
+        arm_handshake_events();
     }
 
-    // Flush pre-ready buffer after tunnel becomes available
-    void flush_pre_buf(int32_t sid) {
-        auto it = streams_.find(sid);
-        if (it == streams_.end()) return;
-        StreamState& ss = it->second;
-        bool has_data = !ss.pre_buf.empty();
-        bool has_eof  = ss.pre_eof;
-        if (has_data || has_eof) {
-            const uint8_t* ptr = has_data ? ss.pre_buf.data() : nullptr;
-            size_t         len = has_data ? ss.pre_buf.size() : 0;
-            feed_data_src(sid, ss, ptr, len, has_eof);
-            ss.pre_buf.clear();
+    void handle_tls_handshake(int /*events*/) {
+        // Try early data on every handshake event in case SSL_in_early_data()
+        // became true only after the first WRITABLE (ClientHello fully sent).
+        try_send_h2_early_data();
+
+        if (!tls_sock_.continue_handshake()) {
+            on_connect_fail(); return;
         }
+        if (!tls_sock_.is_connected()) {
+            arm_handshake_events(); return;
+        }
+
+        auto info = tls_sock_.get_tls_info();
+        PROXY_LOG_INFO("[tunnel] TLS done. version=" << info.version
+                       << " cipher=" << info.cipher << " alpn=" << info.alpn);
+
+        if (!info.alpn.empty() && info.alpn != "h2") {
+            PROXY_LOG_ERROR("[tunnel] Server did not negotiate h2 (got: " << info.alpn << ")");
+            on_connect_fail(); return;
+        }
+
+        // If the server accepted our 0-RTT early data, the H2 preface is already
+        // on the wire — suppress the duplicate that nghttp2 will try to send.
+        if (early_data_attempted_ && tls_sock_.is_early_data_accepted()) {
+            skip_h2_preface_ = true;
+            PROXY_LOG_INFO("[tunnel] 0-RTT accepted");
+        } else if (early_data_attempted_) {
+            PROXY_LOG_INFO("[tunnel] 0-RTT rejected; H2 preface will be re-sent");
+        }
+
+        if (!init_h2()) { on_connect_fail(); return; }
+
+        state_ = State::CONNECTED;
+        update_reactor();
+
+        auto cb = std::move(on_connected_);
+        on_connected_ = nullptr;
+        if (cb) cb(true);
     }
 
-    void on_fd_event(int /*fd*/, int events) {
-        if (state_ != State::CONNECTED) return;
-
+    void handle_data(int /*fd*/, int events) {
         if (events & Event::READABLE) {
             uint8_t buf[16384];
             do {
@@ -402,13 +384,11 @@ private:
                     ssize_t rv = nghttp2_session_mem_recv(h2_, buf, n);
                     if (rv < 0) {
                         PROXY_LOG_ERROR("[tunnel] nghttp2_session_mem_recv: " << nghttp2_strerror(rv));
-                        disconnect();
-                        return;
+                        disconnect(); return;
                     }
                 } else if (n == 0) {
                     PROXY_LOG_INFO("[tunnel] Server closed connection");
-                    disconnect();
-                    return;
+                    disconnect(); return;
                 } else {
                     break;
                 }
@@ -422,6 +402,107 @@ private:
         }
 
         if (state_ == State::CONNECTED) update_reactor();
+    }
+
+    void try_send_h2_early_data() {
+        if (early_data_attempted_ || !pending_session_) return;
+        static const uint8_t H2_MAGIC[24] = {
+            'P','R','I',' ','*',' ','H','T','T','P','/','2','.','0','\r','\n',
+            '\r','\n','S','M','\r','\n','\r','\n'
+        };
+        if (tls_sock_.try_write_early_data(H2_MAGIC, sizeof(H2_MAGIC))) {
+            early_data_attempted_ = true;
+            PROXY_LOG_INFO("[tunnel] H2 magic sent as 0-RTT early data");
+        }
+    }
+
+    void arm_handshake_events() {
+        int ev = Event::READABLE;
+        if (tls_sock_.want_write()) ev |= Event::WRITABLE;
+        reactor_.modify(fd_, ev);
+    }
+
+    bool init_h2() {
+        nghttp2_session_callbacks* cbs;
+        nghttp2_session_callbacks_new(&cbs);
+        nghttp2_session_callbacks_set_send_callback(cbs, on_send_cb);
+        nghttp2_session_callbacks_set_on_frame_recv_callback(cbs, on_frame_recv_cb);
+        nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cbs, on_data_chunk_cb);
+        nghttp2_session_callbacks_set_on_stream_close_callback(cbs, on_stream_close_cb);
+        nghttp2_session_callbacks_set_on_header_callback(cbs, on_header_cb);
+        int rv = nghttp2_session_client_new(&h2_, cbs, this);
+        nghttp2_session_callbacks_del(cbs);
+        if (rv != 0) {
+            PROXY_LOG_ERROR("[tunnel] nghttp2_session_client_new: " << nghttp2_strerror(rv));
+            return false;
+        }
+        nghttp2_settings_entry settings[] = {
+            { NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 100 },
+            { NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE,    1 << 20 },
+        };
+        nghttp2_submit_settings(h2_, NGHTTP2_FLAG_NONE, settings, 2);
+        nghttp2_submit_window_update(h2_, NGHTTP2_FLAG_NONE, 0, (1 << 20) - 65535);
+        // flush_h2() triggers on_send_cb which will skip the H2 magic if 0-RTT accepted.
+        flush_h2();
+        return true;
+    }
+
+    void on_connect_fail() {
+        state_ = State::DISCONNECTED;
+        if (fd_ >= 0) { reactor_.remove(fd_); close_fd(fd_); fd_ = -1; }
+        tls_sock_.close();
+        auto cb = std::move(on_connected_);
+        on_connected_ = nullptr;
+        if (cb) cb(false);
+    }
+
+    // ── Data path helpers (same as before) ───────────────────────────────────
+
+    static ssize_t stream_data_read_cb(nghttp2_session*, int32_t,
+                                        uint8_t* buf, size_t cap, uint32_t* flags,
+                                        nghttp2_data_source* ds, void*) {
+        auto* src = static_cast<DataSrc*>(ds->ptr);
+        if (src->chunks.empty()) {
+            if (src->eof) { *flags |= NGHTTP2_DATA_FLAG_EOF; delete src; ds->ptr = nullptr; return 0; }
+            return NGHTTP2_ERR_DEFERRED;
+        }
+        auto& chunk = src->chunks.front();
+        size_t n = std::min(chunk.size(), cap);
+        memcpy(buf, chunk.data(), n);
+        chunk.erase(chunk.begin(), chunk.begin() + n);
+        if (chunk.empty()) src->chunks.pop_front();
+        return (ssize_t)n;
+    }
+
+    void feed_data_src(int32_t sid, StreamState& ss,
+                        const uint8_t* data, size_t len, bool eof) {
+        if (!ss.data_src) ss.data_src = new DataSrc();
+        if (data && len > 0)
+            ss.data_src->chunks.push_back(std::vector<uint8_t>(data, data + len));
+        if (eof) ss.data_src->eof = true;
+
+        if (!ss.data_src->submitted) {
+            ss.data_src->submitted = true;
+            nghttp2_data_provider prov;
+            prov.source.ptr     = ss.data_src;
+            prov.read_callback  = stream_data_read_cb;
+            int rv = nghttp2_submit_data(h2_, NGHTTP2_FLAG_NONE, sid, &prov);
+            if (rv != 0) PROXY_LOG_ERROR("[tunnel] nghttp2_submit_data: " << nghttp2_strerror(rv));
+        } else {
+            nghttp2_session_resume_data(h2_, sid);
+        }
+    }
+
+    void flush_pre_buf(int32_t sid) {
+        auto it = streams_.find(sid);
+        if (it == streams_.end()) return;
+        StreamState& ss = it->second;
+        if (!ss.pre_buf.empty() || ss.pre_eof) {
+            feed_data_src(sid, ss,
+                          ss.pre_buf.empty() ? nullptr : ss.pre_buf.data(),
+                          ss.pre_buf.size(), ss.pre_eof);
+            ss.pre_buf.clear();
+        }
     }
 
     void flush_h2() {
@@ -439,11 +520,8 @@ private:
             uint8_t tmp[16384];
             std::copy(write_buf_.begin(), write_buf_.begin() + chunk, tmp);
             ssize_t n = tls_sock_.write(tmp, chunk);
-            if (n > 0) {
-                write_buf_.erase(write_buf_.begin(), write_buf_.begin() + n);
-            } else {
-                break;
-            }
+            if (n > 0) write_buf_.erase(write_buf_.begin(), write_buf_.begin() + n);
+            else break;
         }
     }
 
@@ -451,50 +529,53 @@ private:
         if (fd_ < 0) return;
         int ev = Event::READABLE;
         if (tls_sock_.want_write() || !write_buf_.empty()
-            || (h2_ && nghttp2_session_want_write(h2_))) {
+            || (h2_ && nghttp2_session_want_write(h2_)))
             ev |= Event::WRITABLE;
-        }
         reactor_.modify(fd_, ev);
     }
 
     void disconnect() {
         if (state_ == State::DISCONNECTED) return;
         state_ = State::DISCONNECTED;
-        if (fd_ >= 0) {
-            reactor_.remove(fd_);
-        }
-        if (h2_) {
-            nghttp2_session_del(h2_);
-            h2_ = nullptr;
-        }
+        if (fd_ >= 0) { reactor_.remove(fd_); close_fd(fd_); fd_ = -1; }
+        if (h2_) { nghttp2_session_del(h2_); h2_ = nullptr; }
         tls_sock_.close();
-        // Notify all streams they're closed and free data sources
         for (auto& [sid, ss] : streams_) {
             delete ss.data_src;
             if (ss.cbs.on_close) ss.cbs.on_close(NGHTTP2_INTERNAL_ERROR);
         }
         streams_.clear();
-        fd_ = -1;
     }
 
-    // ── nghttp2 callbacks ────────────────────────────────────────────────────
+    // ── nghttp2 callbacks ─────────────────────────────────────────────────────
 
     static ssize_t on_send_cb(nghttp2_session*, const uint8_t* data, size_t len,
                                int, void* ud) {
         auto* self = static_cast<TunnelConn*>(ud);
 
-        if (!self->write_buf_.empty()) {
-            return NGHTTP2_ERR_WOULDBLOCK;
+        // If the H2 connection preface was already sent as 0-RTT early data,
+        // suppress the copy that nghttp2 sends at session init time.
+        if (self->skip_h2_preface_ && len == 24) {
+            static const uint8_t H2_MAGIC[24] = {
+                'P','R','I',' ','*',' ','H','T','T','P','/','2','.','0','\r','\n',
+                '\r','\n','S','M','\r','\n','\r','\n'
+            };
+            if (memcmp(data, H2_MAGIC, 24) == 0) {
+                self->skip_h2_preface_ = false;
+                return 24; // pretend sent
+            }
+            self->skip_h2_preface_ = false;
         }
+
+        if (!self->write_buf_.empty()) return NGHTTP2_ERR_WOULDBLOCK;
         ssize_t n = self->tls_sock_.write(data, len);
         if (n < 0) {
             if (self->tls_sock_.want_write() || self->tls_sock_.want_read())
                 return NGHTTP2_ERR_WOULDBLOCK;
             return NGHTTP2_ERR_CALLBACK_FAILURE;
         }
-        if ((size_t)n < len) {
+        if ((size_t)n < len)
             self->write_buf_.insert(self->write_buf_.end(), data + n, data + len);
-        }
         return (ssize_t)len;
     }
 
@@ -504,19 +585,12 @@ private:
 
         if (frame->hd.type == NGHTTP2_HEADERS
             && frame->headers.cat == NGHTTP2_HCAT_RESPONSE) {
-            // Status is parsed in on_header_cb; here we check if tunnel is ready
-            // (status 200 is set in on_header_cb)
             auto it = self->streams_.find(sid);
             if (it != self->streams_.end() && it->second.tunnel_ready) {
                 PROXY_LOG_INFO("[tunnel] Stream " << sid << " tunnel ready");
                 if (it->second.cbs.on_ready) it->second.cbs.on_ready();
-                // flush_pre_buf only submits to nghttp2 queue; the actual send
-                // happens in on_fd_event's flush_h2() after mem_recv returns.
-                // Do NOT call flush_h2() / nghttp2_session_send() here — calling
-                // it from within an nghttp2 callback causes re-entrancy and
-                // results in the session silently stalling.
                 self->flush_pre_buf(sid);
-                self->update_reactor(); // ensure tunnel fd is armed for WRITABLE
+                self->update_reactor();
             }
         }
 
@@ -528,7 +602,6 @@ private:
                 self->streams_.erase(it);
             }
         }
-
         return 0;
     }
 
@@ -538,15 +611,12 @@ private:
                              uint8_t, void* ud) {
         auto* self = static_cast<TunnelConn*>(ud);
         int32_t sid = frame->hd.stream_id;
-
         if (namelen == 7 && memcmp(name, ":status", 7) == 0) {
             std::string status((const char*)value, valuelen);
             PROXY_LOG_DEBUG("[tunnel] Stream " << sid << " :status=" << status);
             if (status == "200") {
                 auto it = self->streams_.find(sid);
-                if (it != self->streams_.end()) {
-                    it->second.tunnel_ready = true;
-                }
+                if (it != self->streams_.end()) it->second.tunnel_ready = true;
             }
         }
         return 0;
@@ -555,12 +625,10 @@ private:
     static int on_data_chunk_cb(nghttp2_session* session, uint8_t, int32_t sid,
                                   const uint8_t* data, size_t len, void* ud) {
         auto* self = static_cast<TunnelConn*>(ud);
-        // Acknowledge received bytes so nghttp2 sends WINDOW_UPDATE
         nghttp2_session_consume(session, sid, len);
         auto it = self->streams_.find(sid);
-        if (it != self->streams_.end() && it->second.cbs.on_data) {
+        if (it != self->streams_.end() && it->second.cbs.on_data)
             it->second.cbs.on_data(data, len);
-        }
         return 0;
     }
 
@@ -588,24 +656,33 @@ private:
     std::string    fingerprint_path_;
     std::deque<uint8_t> write_buf_;
     std::unordered_map<int32_t, StreamState> streams_;
+
+    std::function<void(bool)> on_connected_;
+    SSL_SESSION*              pending_session_;     // borrowed, NOT owned
+    bool                      early_data_attempted_;
+    bool                      skip_h2_preface_;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// LocalSession — one browser ↔ proxy connection
+// LocalSession — one browser ↔ proxy connection.
+// Creates its own TunnelConn when it receives the CONNECT request.
 // ─────────────────────────────────────────────────────────────────────────────
 class LocalSession : public std::enable_shared_from_this<LocalSession> {
 public:
     using CleanupCb = std::function<void(int)>;
 
     LocalSession(int fd, Reactor& reactor,
-                 std::shared_ptr<TunnelConn> tunnel,
+                 TunnelConfig config,
+                 std::shared_ptr<SessionCache> session_cache,
                  CleanupCb on_close)
-        : fd_(fd), reactor_(reactor), tunnel_(std::move(tunnel))
+        : fd_(fd), reactor_(reactor)
+        , config_(std::move(config))
+        , session_cache_(std::move(session_cache))
         , stream_id_(-1), state_(State::READ_CONNECT)
         , on_close_(std::move(on_close)) {}
 
     ~LocalSession() {
-        if (stream_id_ >= 0) tunnel_->close_stream(stream_id_);
+        if (stream_id_ >= 0 && tunnel_) tunnel_->close_stream(stream_id_);
         reactor_.remove(fd_);
         close_fd(fd_);
     }
@@ -621,20 +698,13 @@ private:
 
     void on_event(int /*fd*/, int events) {
         if (state_ == State::CLOSING) return;
-
         if (events & Event::READABLE) {
-            if (state_ == State::READ_CONNECT) {
-                read_connect_request();
-            } else if (state_ == State::TUNNELING) {
-                forward_to_tunnel();
-            }
+            if      (state_ == State::READ_CONNECT) read_connect_request();
+            else if (state_ == State::TUNNELING)    forward_to_tunnel();
         }
-        if (events & Event::WRITABLE) {
-            flush_to_browser();
-        }
+        if (events & Event::WRITABLE) flush_to_browser();
     }
 
-    // Parse "CONNECT host:port HTTP/1.1\r\n..." from browser
     void read_connect_request() {
         char buf[4096];
         ssize_t n = sock_recv(fd_, buf, sizeof(buf) - 1, 0);
@@ -642,53 +712,68 @@ private:
         buf[n] = '\0';
         incoming_buf_.insert(incoming_buf_.end(), buf, buf + n);
 
-        // Look for end of HTTP headers
         std::string req(incoming_buf_.begin(), incoming_buf_.end());
         size_t hdr_end = req.find("\r\n\r\n");
-        if (hdr_end == std::string::npos) return; // need more data
+        if (hdr_end == std::string::npos) return;
 
-        // Parse first line: CONNECT host:port HTTP/1.x
         size_t line_end = req.find("\r\n");
         std::string first_line = req.substr(0, line_end);
-
         std::string method, authority, version;
         std::istringstream iss(first_line);
         iss >> method >> authority >> version;
 
         if (method != "CONNECT") {
-            // Non-CONNECT: return 405
             const char* resp = "HTTP/1.1 405 Method Not Allowed\r\n\r\n";
             sock_send(fd_, resp, strlen(resp), 0);
-            do_close();
-            return;
+            do_close(); return;
         }
 
-        // Split authority into host:port
         size_t colon = authority.rfind(':');
         if (colon == std::string::npos) { do_close(); return; }
-        std::string target_host = authority.substr(0, colon);
-        uint16_t    target_port = (uint16_t)std::stoi(authority.substr(colon + 1));
+        target_host_ = authority.substr(0, colon);
+        target_port_ = (uint16_t)std::stoi(authority.substr(colon + 1));
 
-        PROXY_LOG_INFO("[local] CONNECT " << target_host << ":" << target_port
+        PROXY_LOG_INFO("[local] CONNECT " << target_host_ << ":" << target_port_
                        << " fd=" << fd_);
 
-        // Open H2 CONNECT stream on the tunnel
         state_ = State::WAIT_TUNNEL;
         incoming_buf_.clear();
 
+        // Create a fresh TunnelConn and connect using any cached session ticket.
+        tunnel_ = std::make_shared<TunnelConn>(reactor_, config_.reality_psk,
+                                               config_.fingerprint_path);
         auto self = shared_from_this();
-        stream_id_ = tunnel_->open_stream(target_host, target_port, {
-            // on_ready: tunnel established, send 200 to browser
-            [self]() {
-                self->on_tunnel_ready();
-            },
-            // on_data: data from remote target → send to browser
-            [self](const uint8_t* data, size_t len) {
-                self->on_tunnel_data(data, len);
-            },
-            // on_close
+        SSL_SESSION* sess = session_cache_ ? session_cache_->get() : nullptr;
+
+        if (!tunnel_->start_connect(config_.host, config_.port, sess,
+                                    [self](bool ok) { self->on_tunnel_connected(ok); })) {
+            const char* resp = "HTTP/1.1 503 Tunnel Failed\r\n\r\n";
+            sock_send(fd_, resp, strlen(resp), 0);
+            do_close();
+        }
+    }
+
+    void on_tunnel_connected(bool ok) {
+        if (state_ == State::CLOSING) return;
+
+        if (!ok) {
+            const char* resp = "HTTP/1.1 503 Tunnel Failed\r\n\r\n";
+            sock_send(fd_, resp, strlen(resp), 0);
+            do_close(); return;
+        }
+
+        // Persist the fresh session ticket for the next connection.
+        if (session_cache_) {
+            SSL_SESSION* new_sess = tunnel_->take_session();
+            if (new_sess) session_cache_->update(new_sess);
+        }
+
+        auto self = shared_from_this();
+        stream_id_ = tunnel_->open_stream(target_host_, target_port_, {
+            [self]()                              { self->on_tunnel_ready(); },
+            [self](const uint8_t* d, size_t len)  { self->on_tunnel_data(d, len); },
             [self](uint32_t err) {
-                PROXY_LOG_DEBUG("[local] Tunnel stream closed err=" << err << " fd=" << self->fd_);
+                PROXY_LOG_DEBUG("[local] Stream closed err=" << err << " fd=" << self->fd_);
                 self->do_close();
             }
         });
@@ -701,7 +786,6 @@ private:
     }
 
     void on_tunnel_ready() {
-        // Send "200 Connection Established" to browser
         const char* resp = "HTTP/1.1 200 Connection Established\r\n\r\n";
         sock_send(fd_, resp, strlen(resp), 0);
         state_ = State::TUNNELING;
@@ -710,20 +794,17 @@ private:
     }
 
     void on_tunnel_data(const uint8_t* data, size_t len) {
-        // Buffer data from remote; flush immediately or queue if busy
         to_browser_buf_.insert(to_browser_buf_.end(), data, data + len);
         flush_to_browser();
     }
 
     void forward_to_tunnel() {
-        // Read from browser, send to tunnel
         uint8_t buf[16384];
         ssize_t n = sock_recv(fd_, buf, sizeof(buf), 0);
         if (n <= 0) {
             tunnel_->close_stream(stream_id_);
             stream_id_ = -1;
-            do_close();
-            return;
+            do_close(); return;
         }
         tunnel_->send_stream_data(stream_id_, buf, n);
     }
@@ -744,18 +825,13 @@ private:
                 errno == EAGAIN || errno == EWOULDBLOCK
 #endif
             )) {
-                // Enable WRITABLE to retry
                 reactor_.modify(fd_, Event::READABLE | Event::WRITABLE);
                 return;
             } else {
-                do_close();
-                return;
+                do_close(); return;
             }
         }
-        // Buffer drained, stop monitoring WRITABLE
-        if (state_ == State::TUNNELING) {
-            reactor_.modify(fd_, Event::READABLE);
-        }
+        if (state_ == State::TUNNELING) reactor_.modify(fd_, Event::READABLE);
     }
 
     void do_close() {
@@ -766,10 +842,14 @@ private:
 
     int    fd_;
     Reactor& reactor_;
-    std::shared_ptr<TunnelConn> tunnel_;
+    TunnelConfig config_;
+    std::shared_ptr<SessionCache> session_cache_;
+    std::shared_ptr<TunnelConn>   tunnel_;
     int32_t stream_id_;
     State   state_;
     CleanupCb on_close_;
+    std::string  target_host_;
+    uint16_t     target_port_ = 0;
     std::vector<char>    incoming_buf_;
     std::deque<uint8_t>  to_browser_buf_;
 };
@@ -784,22 +864,13 @@ public:
                 std::string reality_psk = "",
                 std::string fingerprint_path = "")
         : local_port_(local_port)
-        , tunnel_host_(tunnel_host)
-        , tunnel_port_(tunnel_port)
-        , reality_psk_(std::move(reality_psk))
-        , fingerprint_path_(std::move(fingerprint_path)) {}
+        , config_({ tunnel_host, tunnel_port,
+                    std::move(reality_psk), std::move(fingerprint_path) })
+        , session_cache_(std::make_shared<SessionCache>()) {}
 
     bool run() {
         if (!reactor_.init()) return false;
 
-        // Connect tunnel
-        tunnel_ = std::make_shared<TunnelConn>(reactor_, reality_psk_, fingerprint_path_);
-        if (!tunnel_->connect(tunnel_host_, tunnel_port_)) {
-            PROXY_LOG_ERROR("[proxy] Failed to connect to tunnel server");
-            return false;
-        }
-
-        // Listen locally
 #ifdef _WIN32
         listen_fd_ = posix_compat::socket_fd(AF_INET, SOCK_STREAM, 0);
 #else
@@ -810,7 +881,7 @@ public:
 
         struct sockaddr_in addr{};
         addr.sin_family      = AF_INET;
-        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // 127.0.0.1 only
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         addr.sin_port        = htons(local_port_);
 #ifdef _WIN32
         posix_compat::bind_fd(listen_fd_, (struct sockaddr*)&addr, sizeof(addr));
@@ -822,14 +893,14 @@ public:
         set_nonblocking(listen_fd_);
 
         PROXY_LOG_INFO("[proxy] Local HTTP proxy listening on 127.0.0.1:" << local_port_);
+        PROXY_LOG_INFO("[proxy] Tunnel server: " << config_.host << ":" << config_.port
+                       << " (per-request connections, 0-RTT enabled)");
 
         reactor_.add(listen_fd_, Event::READABLE, [this](int fd, int) {
             this->on_accept(fd);
         });
 
-        while (true) {
-            reactor_.wait(100);
-        }
+        while (true) reactor_.wait(100);
         return true;
     }
 
@@ -847,23 +918,18 @@ private:
 
         PROXY_LOG_INFO("[proxy] Accepted local connection fd=" << client_fd);
 
-        auto cleanup = [this](int fd) {
-            sessions_.erase(fd);
-        };
-
-        auto session = std::make_shared<LocalSession>(client_fd, reactor_, tunnel_, cleanup);
+        auto cleanup = [this](int fd) { sessions_.erase(fd); };
+        auto session = std::make_shared<LocalSession>(
+            client_fd, reactor_, config_, session_cache_, cleanup);
         sessions_[client_fd] = session;
         session->start();
     }
 
     uint16_t    local_port_;
-    std::string tunnel_host_;
-    uint16_t    tunnel_port_;
-    std::string reality_psk_;
-    std::string fingerprint_path_;
+    TunnelConfig config_;
+    std::shared_ptr<SessionCache> session_cache_;
     int         listen_fd_ = -1;
     Reactor     reactor_;
-    std::shared_ptr<TunnelConn> tunnel_;
     std::unordered_map<int, std::shared_ptr<LocalSession>> sessions_;
 };
 

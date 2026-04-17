@@ -29,6 +29,7 @@ public:
             // 如果没有证书，init_server 内部会生成自签名证书
         }
         tls_ctx_.set_alpn({"h2", "http/1.1"});
+        tls_ctx_.enable_early_data();
 
         // 2. 创建监听 Socket
         int listen_fd = socket(AF_INET, SOCK_STREAM, 0);

@@ -81,4 +81,5 @@ private:
     CleanupCallback on_close_;
     std::deque<uint8_t> write_buffer_;
     std::unordered_map<int32_t, StreamInfo> streams_;
+
 };

@@ -484,6 +484,13 @@ bool TlsSocket::continue_handshake() {
             return true;
         }
         
+        // 0-RTT rejected: reset and retry handshake without early data
+        if (err == SSL_ERROR_EARLY_DATA_REJECTED) {
+            SSL_reset_early_data_reject(ssl_);
+            want_read_ = true;
+            want_write_ = false;
+            return true;
+        }
         unsigned long e = ERR_get_error();
         char err_buf[256];
         ERR_error_string_n(e, err_buf, sizeof(err_buf));
@@ -497,20 +504,25 @@ bool TlsSocket::continue_handshake() {
     return true;
 }
 
-bool TlsSocket::connect(int fd, TlsContext& ctx, const std::string& hostname) {
+bool TlsSocket::connect(int fd, TlsContext& ctx, const std::string& hostname,
+                        SSL_SESSION* session) {
     fd_ = fd;
     ssl_ = SSL_new(ctx.ctx());
     if (!ssl_) {
         return false;
     }
 
-    // 若已调用 set_reality_bind()，现在把 bind_data_ 挂到 SSL ex_data
     if (bind_data_.active && g_reality_ex_idx >= 0) {
         SSL_set_ex_data(ssl_, g_reality_ex_idx, &bind_data_);
     }
 
     if (!hostname.empty()) {
         SSL_set_tlsext_host_name(ssl_, hostname.c_str());
+    }
+
+    // Set session for resumption / 0-RTT; must happen before SSL_connect.
+    if (session) {
+        SSL_set_session(ssl_, session);
     }
     
     #ifdef _WIN32
@@ -706,4 +718,36 @@ void TlsSocket::set_reality_bind(const std::string& psk) {
     if (ssl_ && g_reality_ex_idx >= 0) {
         SSL_set_ex_data(ssl_, g_reality_ex_idx, &bind_data_);
     }
+}
+
+// ─── TLS 1.3 0-RTT / session ticket (BoringSSL API) ─────────────────────────
+//
+// BoringSSL does not have SSL_write_early_data / SSL_read_early_data.
+// Instead:
+//   Client: SSL_write() during SSL_in_early_data() sends 0-RTT data.
+//   Server: SSL_CTX_set_early_data_enabled() allows reception; early data
+//           arrives transparently via the normal SSL_read() path.
+
+void TlsContext::enable_early_data() {
+    if (!ctx_) return;
+    SSL_CTX_set_early_data_enabled(ctx_, 1);
+    early_data_enabled_ = true;
+}
+
+SSL_SESSION* TlsSocket::get_session() const {
+    return ssl_ ? SSL_get0_session(ssl_) : nullptr;
+}
+
+bool TlsSocket::is_early_data_accepted() const {
+    return ssl_ && SSL_early_data_accepted(ssl_) == 1;
+}
+
+bool TlsSocket::in_early_data() const {
+    return ssl_ && SSL_in_early_data(ssl_) == 1;
+}
+
+bool TlsSocket::try_write_early_data(const void* buf, size_t len) {
+    if (!ssl_ || !SSL_in_early_data(ssl_)) return false;
+    int ret = SSL_write(ssl_, buf, (int)len);
+    return ret == (int)len;
 }
