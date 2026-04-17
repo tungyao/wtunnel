@@ -14,6 +14,9 @@ struct ChromeFingerprint {
     // supported_groups (curves) in order
     std::vector<uint16_t> curves;
 
+    // ec_point_formats in order (0=uncompressed, 1=compressed_prime, 2=compressed_char2)
+    std::vector<uint8_t> ec_point_formats;
+
     // signature_algorithms in order (combined uint16: high byte = hash, low byte = sig)
     std::vector<uint16_t> sig_algs;
 
@@ -25,7 +28,7 @@ struct ChromeFingerprint {
     bool status_request         = false;   // OCSP
     bool encrypt_then_mac       = false;
     bool extended_master_secret = false;
-    bool grease                 = true;    // BoringSSL always sends GREASE; keep enabled
+    bool grease                 = false;   // set true if GREASE values detected in capture
 
     // Parse a Wireshark "File > Export Packet Dissections > As Plain Text" dump.
     // Returns true on success (at least cipher suites found).

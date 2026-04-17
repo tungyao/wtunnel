@@ -40,6 +40,8 @@ bool ChromeFingerprint::parse_wireshark_text(const std::string& text, ChromeFing
     bool in_supported_groups   = false;
     bool in_sig_algs           = false;
     bool in_supported_versions = false;
+    bool in_ec_point_formats   = false;
+    bool just_saw_extension    = false;  // next "Type:" line holds the ext ID
 
     while (std::getline(stream, line)) {
         std::string t = ltrim(line);
@@ -65,12 +67,23 @@ bool ChromeFingerprint::parse_wireshark_text(const std::string& text, ChromeFing
             continue;
         }
 
+        if (t.find("Elliptic curves point formats (") != std::string::npos ||
+            t.find("EC point formats Length:") != std::string::npos) {
+            in_cipher_suites      = false;
+            in_supported_groups   = false;
+            in_sig_algs           = false;
+            in_supported_versions = false;
+            in_ec_point_formats   = true;
+            continue;
+        }
+
         if (t.find("Supported Groups List Length:") != std::string::npos ||
             t.find("Supported Groups (") != std::string::npos) {
             in_cipher_suites      = false;
             in_supported_groups   = true;
             in_sig_algs           = false;
             in_supported_versions = false;
+            in_ec_point_formats   = false;
             continue;
         }
 
@@ -93,18 +106,14 @@ bool ChromeFingerprint::parse_wireshark_text(const std::string& text, ChromeFing
 
         // Detect entering a new top-level Extension block (resets sub-sections)
         if (t.rfind("Extension: ", 0) == 0) {
-            in_cipher_suites    = false;
-            in_supported_groups = false;
-            in_sig_algs         = false;
+            in_cipher_suites      = false;
+            in_supported_groups   = false;
+            in_sig_algs           = false;
             in_supported_versions = false;
+            in_ec_point_formats   = false;
+            just_saw_extension    = true;  // next "Type:" line gives the ID
 
-            // Record extension type
-            uint16_t ext_type = extract_paren_hex(t);
-            if (ext_type != 0xffff) {
-                out.extensions.push_back(ext_type);
-            }
-
-            // Feature flags from extension presence
+            // Feature flags from extension presence (names on Extension: line)
             if (t.find("session_ticket") != std::string::npos)
                 out.session_ticket = true;
             if (t.find("status_request") != std::string::npos)
@@ -113,20 +122,38 @@ bool ChromeFingerprint::parse_wireshark_text(const std::string& text, ChromeFing
                 out.encrypt_then_mac = true;
             if (t.find("extended_master_secret") != std::string::npos)
                 out.extended_master_secret = true;
-            if (t.find("supported_groups") != std::string::npos)
-                in_supported_groups = false; // will be set when "List Length" seen
-            if (t.find("signature_algorithms") != std::string::npos)
-                in_sig_algs = false;
-            if (t.find("supported_versions") != std::string::npos)
-                in_supported_versions = false;
             continue;
+        }
+
+        // "Type: name (decimal)" sub-line immediately after "Extension: " gives
+        // the numeric extension type ID (Wireshark uses decimal, not hex here).
+        if (just_saw_extension && t.rfind("Type:", 0) == 0) {
+            just_saw_extension = false;
+            auto lp = t.rfind('(');
+            auto rp = t.rfind(')');
+            if (lp != std::string::npos && rp != std::string::npos && rp > lp) {
+                try {
+                    uint16_t id = (uint16_t)std::stoul(t.substr(lp + 1, rp - lp - 1));
+                    out.extensions.push_back(id);
+                } catch (...) {}
+            }
+            continue;
+        }
+        if (just_saw_extension && !t.empty()) {
+            // Non-Type line resets (shouldn't happen in well-formed dumps)
+            just_saw_extension = false;
         }
 
         // ── Data collection ────────────────────────────────────────────────
 
         if (in_cipher_suites && t.rfind("Cipher Suite:", 0) == 0) {
             uint16_t id = extract_paren_hex(t);
-            if (id != 0xffff) out.cipher_suites.push_back(id);
+            if (id != 0xffff) {
+                out.cipher_suites.push_back(id);
+                // Detect GREASE cipher: low byte == 0x0a and both bytes equal
+                if ((id & 0x0f0f) == 0x0a0a && (id >> 8) == (id & 0xff))
+                    out.grease = true;
+            }
             continue;
         }
 
@@ -145,6 +172,19 @@ bool ChromeFingerprint::parse_wireshark_text(const std::string& text, ChromeFing
         if (in_supported_versions && t.rfind("Supported Version:", 0) == 0) {
             uint16_t id = extract_paren_hex(t);
             if (id != 0xffff) out.versions.push_back(id);
+            continue;
+        }
+
+        if (in_ec_point_formats && t.rfind("EC point format:", 0) == 0) {
+            // Wireshark writes decimal: "EC point format: uncompressed (0)"
+            auto lp = t.rfind('(');
+            auto rp = t.rfind(')');
+            if (lp != std::string::npos && rp != std::string::npos && rp > lp) {
+                try {
+                    uint8_t v = (uint8_t)std::stoul(t.substr(lp + 1, rp - lp - 1));
+                    out.ec_point_formats.push_back(v);
+                } catch (...) {}
+            }
             continue;
         }
     }

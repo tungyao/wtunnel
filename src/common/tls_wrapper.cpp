@@ -133,40 +133,21 @@ bool TlsContext::init_client() {
     return true;
 }
 
-// Chrome 146 extra cipher IDs appended after TLS 1.2 ciphers:
-//   ECDHE-RSA-AES128-SHA (0xc013), ECDHE-RSA-AES256-SHA (0xc014),
-//   RSA-AES128-GCM-SHA256 (0x009c), RSA-AES256-GCM-SHA384 (0x009d),
-//   RSA-AES128-SHA (0x002f), RSA-AES256-SHA (0x0035),
-//   TLS_EMPTY_RENEGOTIATION_INFO_SCSV (0x00ff)
-static const uint16_t kChrome146ExtraCiphers[] = {
-    0xc013, 0xc014, 0x009c, 0x009d, 0x002f, 0x0035, 0x00ff
-};
-
-// Cipher string for the ciphers BoringSSL supports from Chrome 146's TLS 1.2 list
-// (excludes RSA-key-exchange ciphers which BoringSSL dropped; those are injected
-// via kChrome146ExtraCiphers above for fingerprint only).
-// Chrome 146 order: ECDHE-RSA-CHACHA20 (0xcca8), ECDHE-ECDSA-CHACHA20 (0xcca9),
-//   ECDHE-ECDSA-AES128-GCM (0xc02b), ECDHE-RSA-AES128-GCM (0xc02f),
-//   ECDHE-ECDSA-AES256-GCM (0xc02c), ECDHE-RSA-AES256-GCM (0xc030)
-static const char* kChrome146CipherList =
-    "ECDHE-RSA-CHACHA20-POLY1305:"
-    "ECDHE-ECDSA-CHACHA20-POLY1305:"
-    "ECDHE-ECDSA-AES128-GCM-SHA256:"
-    "ECDHE-RSA-AES128-GCM-SHA256:"
-    "ECDHE-ECDSA-AES256-GCM-SHA384:"
-    "ECDHE-RSA-AES256-GCM-SHA384";
-
-// Chrome 146 supported groups (curves): x25519 (29), secp256r1 (23), secp384r1 (24)
-static const uint16_t kChrome146Curves[] = { 29, 23, 24 };
-
-// Chrome 146 signature algorithms:
-//   ecdsa_secp256r1_sha256 (0x0403), rsa_pss_rsae_sha256 (0x0804),
-//   rsa_pkcs1_sha256 (0x0401), ecdsa_secp384r1_sha384 (0x0503),
-//   rsa_pss_rsae_sha384 (0x0805), rsa_pkcs1_sha384 (0x0501),
-//   rsa_pss_rsae_sha512 (0x0806), rsa_pkcs1_sha512 (0x0601)
-static const uint16_t kChrome146SigAlgs[] = {
-    0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601
-};
+// Map a cipher suite ID to an OpenSSL cipher string name.
+// Returns nullptr for IDs BoringSSL does not support (RSA key-exchange, SCSV).
+static const char* cipher_id_to_name(uint16_t id) {
+    switch (id) {
+    case 0xcca8: return "ECDHE-RSA-CHACHA20-POLY1305";
+    case 0xcca9: return "ECDHE-ECDSA-CHACHA20-POLY1305";
+    case 0xc02b: return "ECDHE-ECDSA-AES128-GCM-SHA256";
+    case 0xc02f: return "ECDHE-RSA-AES128-GCM-SHA256";
+    case 0xc02c: return "ECDHE-ECDSA-AES256-GCM-SHA384";
+    case 0xc030: return "ECDHE-RSA-AES256-GCM-SHA384";
+    case 0xc013: return "ECDHE-RSA-AES128-SHA";
+    case 0xc014: return "ECDHE-RSA-AES256-SHA";
+    default:     return nullptr; // RSA key-exchange, SCSV, TLS 1.3 — skip
+    }
+}
 
 void TlsContext::configure_chrome_fingerprint() {
     configure_chrome_fingerprint(nullptr);
@@ -181,57 +162,82 @@ void TlsContext::configure_chrome_fingerprint(const ChromeFingerprint* fp) {
     SSL_CTX_clear_options(ctx_, SSL_OP_NO_TICKET);
     SSL_CTX_set_session_cache_mode(ctx_, SSL_SESS_CACHE_CLIENT);
 
-    // Enable Chrome 146 mode: cipher order + extension order + encrypt_then_mac
+    // Enable Chrome fingerprint mode (controls extension ordering etc.)
     SSL_CTX_enable_chrome_fingerprint_mode(ctx_);
-    // Chrome 146 does not use GREASE in this capture
-    SSL_CTX_set_grease_enabled(ctx_, 0);
 
-    // ── TLS 1.2 cipher list (BoringSSL-supported subset) ───────────────────
-    const char* cipher_str = kChrome146CipherList;
-    if (fp && !fp->cipher_suites.empty()) {
-        // Build cipher string from fingerprint, mapping IDs to OpenSSL names.
-        // BoringSSL only supports ECDHE ciphers; skip RSA-key-exchange ones.
-        // The exact wire order is controlled by kExtensions/cipher list order;
-        // this sets the TLS 1.2 negotiable set.
-        // For simplicity, always use the hardcoded Chrome 146 string since
-        // BoringSSL's cipher API works by name, not raw ID.
-    }
-    SSL_CTX_set_cipher_list(ctx_, cipher_str);
-
-    // ── Extra cipher IDs appended raw (RSA suites + SCSV) ──────────────────
-    if (fp && !fp->cipher_suites.empty()) {
-        // Collect cipher IDs not supported by BoringSSL's SSL_get_ciphers()
-        // (RSA key exchange + SCSV) and inject them for fingerprint.
-        // For the standard Chrome 146 preset, use the hardcoded list.
-        SSL_CTX_set_chrome_extra_ciphers(ctx_, kChrome146ExtraCiphers,
-                                         sizeof(kChrome146ExtraCiphers) /
-                                             sizeof(kChrome146ExtraCiphers[0]));
-    } else {
-        SSL_CTX_set_chrome_extra_ciphers(ctx_, kChrome146ExtraCiphers,
-                                         sizeof(kChrome146ExtraCiphers) /
-                                             sizeof(kChrome146ExtraCiphers[0]));
+    if (!fp || fp->cipher_suites.empty()) {
+        PROXY_LOG_ERROR("[tls] Chrome fingerprint: no cipher suites in fingerprint; "
+                        "use -F <capture.txt> to load a Wireshark dump");
+        return;
     }
 
-    // ── Supported groups (curves) ───────────────────────────────────────────
-    if (fp && !fp->curves.empty()) {
+    // ── GREASE ──────────────────────────────────────────────────────────────
+    SSL_CTX_set_grease_enabled(ctx_, fp->grease ? 1 : 0);
+
+    // ── OCSP status_request ──────────────────────────────────────────────────
+    // Enable stapling so BoringSSL emits the status_request extension.
+    if (fp->status_request) {
+        SSL_CTX_enable_ocsp_stapling(ctx_);
+    }
+
+    // ── Full wire cipher list (verbatim from capture) ────────────────────────
+    // Passed as-is; BoringSSL writes these bytes directly into ClientHello.
+    SSL_CTX_set_chrome_cipher_wire(ctx_, fp->cipher_suites.data(),
+                                   fp->cipher_suites.size());
+
+    // ── TLS 1.2 cipher list for actual negotiation ───────────────────────────
+    // BoringSSL can only negotiate ciphers it knows; build cipher string from
+    // the supported subset of the fingerprint's TLS 1.2 entries.
+    std::string cipher_str;
+    for (uint16_t id : fp->cipher_suites) {
+        const char* name = cipher_id_to_name(id);
+        if (name) {
+            if (!cipher_str.empty()) cipher_str += ':';
+            cipher_str += name;
+        }
+    }
+    if (!cipher_str.empty()) {
+        SSL_CTX_set_cipher_list(ctx_, cipher_str.c_str());
+    }
+
+    // ── Supported groups (curves) ────────────────────────────────────────────
+    if (!fp->curves.empty()) {
         SSL_CTX_set1_curves(ctx_, (const int*)fp->curves.data(),
                             fp->curves.size());
-    } else {
-        SSL_CTX_set1_curves(ctx_, (const int*)kChrome146Curves,
-                            sizeof(kChrome146Curves) / sizeof(kChrome146Curves[0]));
     }
 
-    // ── Signature algorithms ────────────────────────────────────────────────
-    const uint16_t* sig_algs = kChrome146SigAlgs;
-    size_t sig_algs_count = sizeof(kChrome146SigAlgs) / sizeof(kChrome146SigAlgs[0]);
-    if (fp && !fp->sig_algs.empty()) {
-        sig_algs = fp->sig_algs.data();
-        sig_algs_count = fp->sig_algs.size();
+    // ── Signature algorithms ─────────────────────────────────────────────────
+    if (!fp->sig_algs.empty()) {
+        SSL_CTX_set_verify_algorithm_prefs(ctx_, fp->sig_algs.data(),
+                                           fp->sig_algs.size());
     }
-    SSL_CTX_set_verify_algorithm_prefs(ctx_, sig_algs, sig_algs_count);
 
-    PROXY_LOG_INFO("[tls] Chrome 146 TLS fingerprint configured"
-                   << (fp ? " (from Wireshark dump)" : " (built-in preset)"));
+    // ── Supported versions (exact list from capture) ─────────────────────────
+    if (!fp->versions.empty()) {
+        SSL_CTX_set_chrome_versions(ctx_, fp->versions.data(),
+                                    fp->versions.size());
+    }
+
+    // ── Extension order (exact order from capture) ────────────────────────────
+    // Extensions are emitted in exactly this order; those absent from fp->extensions
+    // are not sent. This replaces all per-flag suppression logic.
+    if (!fp->extensions.empty()) {
+        SSL_CTX_set_chrome_ext_order(ctx_, fp->extensions.data(),
+                                     fp->extensions.size());
+    }
+
+    // ── ec_point_formats (exact list from capture) ────────────────────────────
+    if (!fp->ec_point_formats.empty()) {
+        SSL_CTX_set_chrome_ec_point_formats(ctx_, fp->ec_point_formats.data(),
+                                            fp->ec_point_formats.size());
+    }
+
+    PROXY_LOG_INFO("[tls] Chrome TLS fingerprint configured from Wireshark dump: "
+                   << fp->cipher_suites.size() << " ciphers, "
+                   << fp->extensions.size() << " extensions, "
+                   << fp->versions.size() << " versions, "
+                   << fp->ec_point_formats.size() << " ec_point_formats, "
+                   << "grease=" << (fp->grease ? "yes" : "no"));
 }
 
 void TlsContext::set_alpn(const std::vector<std::string>& protocols) {

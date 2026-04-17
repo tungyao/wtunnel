@@ -207,7 +207,9 @@ public:
         PROXY_LOG_INFO("[tunnel] TLS handshake done. version=" << info.version
                        << " cipher=" << info.cipher << " alpn=" << info.alpn);
 
-        if (info.alpn != "h2") {
+        // When chrome_fingerprint_mode suppresses the ALPN extension, the server
+        // won't echo ALPN back; both sides still use h2 directly.
+        if (!info.alpn.empty() && info.alpn != "h2") {
             PROXY_LOG_ERROR("[tunnel] Server did not negotiate h2 (got: " << info.alpn << ")");
             disconnect();
             return false;
