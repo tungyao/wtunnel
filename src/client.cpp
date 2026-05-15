@@ -946,6 +946,7 @@ static void print_usage(const char* prog) {
         "  -P <port>   Tunnel server port           (default: 8443)\n"
         "  -K <psk>    REALITY pre-shared key       (must match server -K)\n"
         "  -F <file>   Wireshark Client Hello text dump for TLS fingerprint\n"
+        "  -v          Verbose output (-v = info, -vv = debug, default: error only)\n"
         "  -h          Show this help message\n"
         "\n"
         "Example:\n"
@@ -966,19 +967,23 @@ int main(int argc, char* argv[]) {
     uint16_t    tunnel_port      = 8443;
     std::string reality_psk;
     std::string fingerprint_path;
+    int verbose = 0;
 
     int opt;
-    while ((opt = getopt(argc, argv, "p:H:P:K:F:h")) != -1) {
+    while ((opt = getopt(argc, argv, "p:H:P:K:F:vh")) != -1) {
         switch (opt) {
         case 'p': local_port       = (uint16_t)std::stoi(optarg); break;
         case 'H': tunnel_host      = optarg;                       break;
         case 'P': tunnel_port      = (uint16_t)std::stoi(optarg); break;
         case 'K': reality_psk      = optarg;                       break;
         case 'F': fingerprint_path = optarg;                       break;
+        case 'v': ++verbose;                                        break;
         case 'h': print_usage(argv[0]); return 0;
         default:  print_usage(argv[0]); return 1;
         }
     }
+    if (verbose >= 2)      set_log_level(LOG_DEBUG);
+    else if (verbose == 1) set_log_level(LOG_INFO);
 
     PROXY_LOG_INFO("[main] Starting wtunnel client");
     PROXY_LOG_INFO("[main] Local proxy  : 0.0.0.0:" << local_port);

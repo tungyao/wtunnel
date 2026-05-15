@@ -6,6 +6,17 @@
 #include <iomanip>
 #include <mutex>
 
+enum LogLevel {
+    LOG_ERROR = 0,
+    LOG_WARN  = 1,
+    LOG_INFO  = 2,
+    LOG_DEBUG = 3,
+};
+
+inline LogLevel g_log_level = LOG_ERROR;
+
+inline void set_log_level(LogLevel level) { g_log_level = level; }
+
 inline std::string get_timestamp() {
     auto now = std::chrono::system_clock::now();
     auto time_t = std::chrono::system_clock::to_time_t(now);
@@ -24,7 +35,7 @@ inline std::string get_timestamp() {
         std::cout << ss.str() << std::endl; \
     } while(0)
 
-#define PROXY_LOG_INFO(msg) PROXY_LOG("INFO", msg)
-#define PROXY_LOG_DEBUG(msg) PROXY_LOG("DEBUG", msg)
-#define PROXY_LOG_ERROR(msg) PROXY_LOG("ERROR", msg)
-#define PROXY_LOG_WARN(msg) PROXY_LOG("WARN", msg)
+#define PROXY_LOG_ERROR(msg) do { if (::g_log_level >= LOG_ERROR) { PROXY_LOG("ERROR", msg); } } while(0)
+#define PROXY_LOG_WARN(msg)  do { if (::g_log_level >= LOG_WARN)  { PROXY_LOG("WARN", msg);  } } while(0)
+#define PROXY_LOG_INFO(msg)  do { if (::g_log_level >= LOG_INFO)  { PROXY_LOG("INFO", msg);  } } while(0)
+#define PROXY_LOG_DEBUG(msg) do { if (::g_log_level >= LOG_DEBUG) { PROXY_LOG("DEBUG", msg); } } while(0)

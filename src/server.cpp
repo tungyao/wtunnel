@@ -121,6 +121,7 @@ static void print_usage(const char* prog) {
         "  -b <addr>         Bind address             (default: 0.0.0.0)\n"
         "  -R <host[:port]>  REALITY: real site target (e.g. www.microsoft.com)\n"
         "  -K <psk>          REALITY: pre-shared key for client auth\n"
+        "  -v                Verbose output (-v = info, -vv = debug, default: error only)\n"
         "  -h                Show this help message\n"
         "\n"
         "REALITY mode (both -R and -K required):\n"
@@ -139,9 +140,10 @@ int main(int argc, char* argv[]) {
     uint16_t    port       = 8443;
     std::string bind_addr  = "0.0.0.0";
     RealityConfig reality;
+    int verbose = 0;
 
     int opt;
-    while ((opt = getopt(argc, argv, "p:b:R:K:h")) != -1) {
+    while ((opt = getopt(argc, argv, "p:b:R:K:vh")) != -1) {
         switch (opt) {
         case 'p': port             = (uint16_t)std::stoi(optarg); break;
         case 'b': bind_addr        = optarg;                       break;
@@ -159,10 +161,13 @@ int main(int argc, char* argv[]) {
             }
             break;
         }
+        case 'v': ++verbose;                                        break;
         case 'h': print_usage(argv[0]); return 0;
         default:  print_usage(argv[0]); return 1;
         }
     }
+    if (verbose >= 2)      set_log_level(LOG_DEBUG);
+    else if (verbose == 1) set_log_level(LOG_INFO);
 
     if (!reality.psk.empty() && reality.target_host.empty()) {
         fprintf(stderr, "Error: -K requires -R <target_host>\n");
