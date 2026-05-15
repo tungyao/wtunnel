@@ -45,6 +45,7 @@
 #  include <getopt.h>
 #endif
 #include <cstring>
+#include <cstdio>
 #include <string>
 #include <unordered_map>
 #include <memory>
@@ -124,6 +125,32 @@ static int tcp_connect_nb(const std::string& host, uint16_t port) {
     freeaddrinfo(res);
     if (r < 0 && errno != EINPROGRESS) { close_fd(fd); return -1; }
     return fd;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Domain matching for direct connect (bypass tunnel)
+// ─────────────────────────────────────────────────────────────────────────────
+// Supports Clash Rule-Set format:
+//   "example.com"   — exact match
+//   "+.example.com" — suffix match (matches www.example.com, api.example.com, etc.)
+//   "*"             — match all domains
+static bool proxy_matches(const std::string& domain,
+                          const std::vector<std::string>& patterns) {
+    for (const auto& p : patterns) {
+        if (p.empty()) continue;
+        if (p == "*") return true;
+        if (p.size() > 1 && p[0] == '+' && p[1] == '.') {
+            // "+.example.com" suffix match
+            std::string suffix = p.substr(1);
+            if (domain.size() >= suffix.size() &&
+                domain.compare(domain.size() - suffix.size(),
+                               suffix.size(), suffix) == 0)
+                return true;
+        } else if (domain == p) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -676,15 +703,18 @@ public:
     LocalSession(int fd, Reactor& reactor,
                  TunnelConfig config,
                  std::shared_ptr<SessionCache> session_cache,
-                 CleanupCb on_close)
+                 CleanupCb on_close,
+                 std::vector<std::string> proxy_domains = {})
         : fd_(fd), reactor_(reactor)
         , config_(std::move(config))
         , session_cache_(std::move(session_cache))
         , stream_id_(-1), state_(State::READ_CONNECT)
-        , on_close_(std::move(on_close)) {}
+        , on_close_(std::move(on_close))
+        , proxy_domains_(std::move(proxy_domains)) {}
 
     ~LocalSession() {
         if (stream_id_ >= 0 && tunnel_) tunnel_->close_stream(stream_id_);
+        if (direct_fd_ >= 0) { reactor_.remove(direct_fd_); close_fd(direct_fd_); }
         reactor_.remove(fd_);
         close_fd(fd_);
     }
@@ -696,13 +726,16 @@ public:
     }
 
 private:
-    enum class State { READ_CONNECT, WAIT_TUNNEL, TUNNELING, CLOSING };
+    enum class State { READ_CONNECT, WAIT_TUNNEL, DIRECT_CONNECTING, TUNNELING, CLOSING };
 
     void on_event(int /*fd*/, int events) {
         if (state_ == State::CLOSING) return;
         if (events & Event::READABLE) {
             if      (state_ == State::READ_CONNECT) read_connect_request();
-            else if (state_ == State::TUNNELING)    forward_to_tunnel();
+            else if (state_ == State::TUNNELING) {
+                if (direct_mode_) forward_to_direct();
+                else              forward_to_tunnel();
+            }
         }
         if (events & Event::WRITABLE) flush_to_browser();
     }
@@ -738,8 +771,27 @@ private:
         PROXY_LOG_INFO("[local] CONNECT " << target_host_ << ":" << target_port_
                        << " fd=" << fd_);
 
-        state_ = State::WAIT_TUNNEL;
         incoming_buf_.clear();
+
+        // If proxy list exists but domain doesn't match it → direct connect
+        if (!proxy_domains_.empty() &&
+            !proxy_matches(target_host_, proxy_domains_)) {
+            PROXY_LOG_INFO("[local] Direct connect " << target_host_ << ":"
+                           << target_port_ << " fd=" << fd_);
+            direct_fd_ = tcp_connect_nb(target_host_, target_port_);
+            if (direct_fd_ < 0) {
+                const char* resp = "HTTP/1.1 503 Connection Failed\r\n\r\n";
+                sock_send(fd_, resp, strlen(resp), 0);
+                do_close(); return;
+            }
+            state_ = State::DIRECT_CONNECTING;
+            auto self = shared_from_this();
+            reactor_.add(direct_fd_, Event::WRITABLE,
+                         [self](int d_fd, int ev) { self->on_direct_connect(d_fd, ev); });
+            return;
+        }
+
+        state_ = State::WAIT_TUNNEL;
 
         // Create a fresh TunnelConn and connect using any cached session ticket.
         tunnel_ = std::make_shared<TunnelConn>(reactor_, config_.reality_psk,
@@ -800,6 +852,52 @@ private:
         flush_to_browser();
     }
 
+    void on_direct_connect(int fd, int events) {
+        if (state_ == State::CLOSING) return;
+        if (!(events & Event::WRITABLE)) return;
+
+        int err = 0; socklen_t len = sizeof(err);
+        getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len);
+        if (err != 0) {
+            PROXY_LOG_ERROR("[local] Direct connect to " << target_host_
+                            << " failed: " << strerror(err));
+            const char* resp = "HTTP/1.1 503 Upstream Failed\r\n\r\n";
+            sock_send(fd_, resp, strlen(resp), 0);
+            do_close(); return;
+        }
+
+        PROXY_LOG_INFO("[local] Direct " << target_host_ << ":" << target_port_
+                       << " connected, fd=" << fd_);
+
+        // Send 200 to browser
+        const char* resp = "HTTP/1.1 200 Connection Established\r\n\r\n";
+        sock_send(fd_, resp, strlen(resp), 0);
+
+        direct_mode_ = true;
+        state_ = State::TUNNELING;
+
+        // Keep browser fd readable
+        reactor_.modify(fd_, Event::READABLE);
+
+        // Start reading from target
+        auto self = shared_from_this();
+        reactor_.add(direct_fd_, Event::READABLE,
+                     [self](int t_fd, int ev) { self->on_direct_target_event(t_fd, ev); });
+    }
+
+    void on_direct_target_event(int /*fd*/, int events) {
+        if (state_ != State::TUNNELING || !direct_mode_) return;
+        if (!(events & Event::READABLE)) return;
+
+        uint8_t buf[16384];
+        ssize_t n = sock_recv(direct_fd_, buf, sizeof(buf), 0);
+        if (n <= 0) {
+            do_close(); return;
+        }
+        to_browser_buf_.insert(to_browser_buf_.end(), buf, buf + n);
+        flush_to_browser();
+    }
+
     void forward_to_tunnel() {
         uint8_t buf[16384];
         ssize_t n = sock_recv(fd_, buf, sizeof(buf), 0);
@@ -809,6 +907,18 @@ private:
             do_close(); return;
         }
         tunnel_->send_stream_data(stream_id_, buf, n);
+    }
+
+    void forward_to_direct() {
+        uint8_t buf[16384];
+        ssize_t n = sock_recv(fd_, buf, sizeof(buf), 0);
+        if (n <= 0) { do_close(); return; }
+        ssize_t written = 0;
+        while (written < n) {
+            ssize_t r = sock_send(direct_fd_, buf + written, n - written, 0);
+            if (r <= 0) { do_close(); return; }
+            written += r;
+        }
     }
 
     void flush_to_browser() {
@@ -839,6 +949,11 @@ private:
     void do_close() {
         if (state_ == State::CLOSING) return;
         state_ = State::CLOSING;
+        if (direct_fd_ >= 0) {
+            reactor_.remove(direct_fd_);
+            close_fd(direct_fd_);
+            direct_fd_ = -1;
+        }
         if (on_close_) on_close_(fd_);
     }
 
@@ -854,6 +969,10 @@ private:
     uint16_t     target_port_ = 0;
     std::vector<char>    incoming_buf_;
     std::deque<uint8_t>  to_browser_buf_;
+
+    int         direct_fd_ = -1;
+    bool        direct_mode_ = false;
+    std::vector<std::string> proxy_domains_;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -864,11 +983,13 @@ public:
     ProxyServer(uint16_t local_port,
                 const std::string& tunnel_host, uint16_t tunnel_port,
                 std::string reality_psk = "",
-                std::string fingerprint_path = "")
+                std::string fingerprint_path = "",
+                std::vector<std::string> proxy_domains = {})
         : local_port_(local_port)
         , config_({ tunnel_host, tunnel_port,
                     std::move(reality_psk), std::move(fingerprint_path) })
-        , session_cache_(std::make_shared<SessionCache>()) {}
+        , session_cache_(std::make_shared<SessionCache>())
+        , proxy_domains_(std::move(proxy_domains)) {}
 
     bool run() {
         if (!reactor_.init()) return false;
@@ -922,7 +1043,7 @@ private:
 
         auto cleanup = [this](int fd) { sessions_.erase(fd); };
         auto session = std::make_shared<LocalSession>(
-            client_fd, reactor_, config_, session_cache_, cleanup);
+            client_fd, reactor_, config_, session_cache_, cleanup, proxy_domains_);
         sessions_[client_fd] = session;
         session->start();
     }
@@ -930,10 +1051,37 @@ private:
     uint16_t    local_port_;
     TunnelConfig config_;
     std::shared_ptr<SessionCache> session_cache_;
+    std::vector<std::string> proxy_domains_;
     int         listen_fd_ = -1;
     Reactor     reactor_;
     std::unordered_map<int, std::shared_ptr<LocalSession>> sessions_;
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Load Clash Rule-Set from local file or HTTP(S) URL
+// ─────────────────────────────────────────────────────────────────────────────
+static std::string load_rules_source(const std::string& path) {
+    if (path.compare(0, 7, "http://") == 0 ||
+        path.compare(0, 8, "https://") == 0) {
+        std::string escaped = path;
+        for (size_t p = 0; (p = escaped.find("'", p)) != std::string::npos;)
+            escaped.replace(p, 1, "'\\''"), p += 4;
+        std::string cmd = "curl -sfL '" + escaped + "' 2>/dev/null";
+        FILE* pipe = popen(cmd.c_str(), "r");
+        if (!pipe) return {};
+        std::string result;
+        char buf[16384];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof(buf), pipe)) > 0)
+            result.append(buf, n);
+        pclose(pipe);
+        return result;
+    }
+    std::ifstream f(path);
+    if (!f.is_open()) return {};
+    return std::string(std::istreambuf_iterator<char>(f),
+                       std::istreambuf_iterator<char>());
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // INI config
@@ -944,6 +1092,7 @@ struct ClientConfig {
     uint16_t    tunnel_port      = 8443;
     std::string reality_psk;
     std::string fingerprint_path;
+    std::string proxy_domains_file;
     int         verbose          = 0;
 };
 
@@ -977,8 +1126,9 @@ static ClientConfig load_ini(const std::string& path) {
             else if (key == "tunnel_host")      cfg.tunnel_host      = value;
             else if (key == "tunnel_port")      cfg.tunnel_port      = (uint16_t)std::stoi(value);
             else if (key == "reality_psk")      cfg.reality_psk      = value;
-            else if (key == "fingerprint_path") cfg.fingerprint_path = value;
-            else if (key == "verbose")          cfg.verbose          = std::stoi(value);
+            else if (key == "fingerprint_path")      cfg.fingerprint_path      = value;
+            else if (key == "proxy_domains_file")  cfg.proxy_domains_file    = value;
+            else if (key == "verbose")              cfg.verbose               = std::stoi(value);
         }
     }
     return cfg;
@@ -997,6 +1147,7 @@ static void print_usage(const char* prog) {
         "  -P <port>   Tunnel server port           (default: 8443)\n"
         "  -K <psk>    REALITY pre-shared key       (must match server -K)\n"
         "  -F <file>   Wireshark Client Hello text dump for TLS fingerprint\n"
+        "  -R <file>   Clash Rule-Set file (proxy list, unmatched domains go direct)\n"
         "  -c <file>   Config file path (default: /etc/wtunnel/client.ini)\n"
         "  -v          Verbose output (-v = info, -vv = debug, default: error only)\n"
         "  -h          Show this help message\n"
@@ -1026,13 +1177,14 @@ int main(int argc, char* argv[]) {
     optind_w = 1;
 #endif
     int opt;
-    while ((opt = getopt(argc, argv, "p:H:P:K:F:c:vh")) != -1) {
+    while ((opt = getopt(argc, argv, "p:H:P:K:F:R:c:vh")) != -1) {
         switch (opt) {
         case 'p': cfg.local_port       = (uint16_t)std::stoi(optarg); break;
         case 'H': cfg.tunnel_host      = optarg;                       break;
         case 'P': cfg.tunnel_port      = (uint16_t)std::stoi(optarg); break;
         case 'K': cfg.reality_psk      = optarg;                       break;
         case 'F': cfg.fingerprint_path = optarg;                       break;
+        case 'R': cfg.proxy_domains_file = optarg;                     break;
         case 'v': ++cfg.verbose;                                        break;
         case 'c': break;
         case 'h': print_usage(argv[0]); return 0;
@@ -1049,8 +1201,43 @@ int main(int argc, char* argv[]) {
     if (!cfg.reality_psk.empty())
         PROXY_LOG_INFO("[main] REALITY mode  : enabled");
 
+    // Load proxy domain patterns (Clash Rule-Set format, local file or URL)
+    std::vector<std::string> proxy_domains;
+    if (!cfg.proxy_domains_file.empty()) {
+        std::string content = load_rules_source(cfg.proxy_domains_file);
+        if (content.empty()) {
+            PROXY_LOG_ERROR("[main] Could not load proxy-domains from: "
+                            << cfg.proxy_domains_file);
+        } else {
+            std::istringstream stream(content);
+            std::string line;
+            while (std::getline(stream, line)) {
+                // Trim whitespace
+                size_t s = line.find_first_not_of(" \t\r\n");
+                if (s == std::string::npos) continue;
+                size_t e = line.find_last_not_of(" \t\r\n");
+                line = line.substr(s, e - s + 1);
+
+                if (line.empty() || line[0] == '#') continue;
+                if (line == "payload:") continue;
+
+                if (line.size() >= 4 && line[0] == '-' && line[1] == ' ') {
+                    std::string val = line.substr(2);
+                    if (val.size() >= 2 && val[0] == '\'' && val.back() == '\'')
+                        val = val.substr(1, val.size() - 2);
+                    if (!val.empty()) proxy_domains.push_back(val);
+                } else {
+                    proxy_domains.push_back(line);
+                }
+            }
+            PROXY_LOG_INFO("[main] Loaded " << proxy_domains.size()
+                           << " proxy domain patterns from " << cfg.proxy_domains_file);
+        }
+    }
+
     ProxyServer proxy(cfg.local_port, cfg.tunnel_host, cfg.tunnel_port,
-                      cfg.reality_psk, cfg.fingerprint_path);
+                      cfg.reality_psk, cfg.fingerprint_path,
+                      std::move(proxy_domains));
     proxy.run();
     return 0;
 }
