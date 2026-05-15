@@ -1,0 +1,13 @@
+[Unit]
+Description=wtunnel client — local HTTP CONNECT proxy over TLS/H2 tunnel
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/qtunnel_client -c /etc/wtunnel/client.ini
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

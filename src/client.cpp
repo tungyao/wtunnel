@@ -52,6 +52,8 @@
 #include <functional>
 #include <vector>
 #include <sstream>
+#include <fstream>
+#include <algorithm>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Forward declarations
@@ -934,6 +936,55 @@ private:
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// INI config
+// ─────────────────────────────────────────────────────────────────────────────
+struct ClientConfig {
+    uint16_t    local_port       = 8080;
+    std::string tunnel_host      = "127.0.0.1";
+    uint16_t    tunnel_port      = 8443;
+    std::string reality_psk;
+    std::string fingerprint_path;
+    int         verbose          = 0;
+};
+
+static std::string trim(const std::string& s) {
+    size_t start = s.find_first_not_of(" \t\r\n");
+    size_t end   = s.find_last_not_of(" \t\r\n");
+    return (start == std::string::npos) ? "" : s.substr(start, end - start + 1);
+}
+
+static ClientConfig load_ini(const std::string& path) {
+    ClientConfig cfg;
+    std::ifstream f(path);
+    if (!f.is_open()) return cfg;
+
+    std::string line, section;
+    while (std::getline(f, line)) {
+        line = trim(line);
+        if (line.empty() || line[0] == '#' || line[0] == ';') continue;
+        if (line[0] == '[') {
+            size_t pos = line.find(']');
+            if (pos != std::string::npos) section = trim(line.substr(1, pos - 1));
+            continue;
+        }
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string key   = trim(line.substr(0, eq));
+        std::string value = trim(line.substr(eq + 1));
+
+        if (section == "client") {
+            if      (key == "local_port")       cfg.local_port       = (uint16_t)std::stoi(value);
+            else if (key == "tunnel_host")      cfg.tunnel_host      = value;
+            else if (key == "tunnel_port")      cfg.tunnel_port      = (uint16_t)std::stoi(value);
+            else if (key == "reality_psk")      cfg.reality_psk      = value;
+            else if (key == "fingerprint_path") cfg.fingerprint_path = value;
+            else if (key == "verbose")          cfg.verbose          = std::stoi(value);
+        }
+    }
+    return cfg;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // main
 // ─────────────────────────────────────────────────────────────────────────────
 static void print_usage(const char* prog) {
@@ -946,6 +997,7 @@ static void print_usage(const char* prog) {
         "  -P <port>   Tunnel server port           (default: 8443)\n"
         "  -K <psk>    REALITY pre-shared key       (must match server -K)\n"
         "  -F <file>   Wireshark Client Hello text dump for TLS fingerprint\n"
+        "  -c <file>   Config file path (default: /etc/wtunnel/client.ini)\n"
         "  -v          Verbose output (-v = info, -vv = debug, default: error only)\n"
         "  -h          Show this help message\n"
         "\n"
@@ -962,36 +1014,43 @@ int main(int argc, char* argv[]) {
     signal(SIGPIPE, SIG_IGN);
 #endif
 
-    uint16_t    local_port       = 8080;
-    std::string tunnel_host      = "127.0.0.1";
-    uint16_t    tunnel_port      = 8443;
-    std::string reality_psk;
-    std::string fingerprint_path;
-    int verbose = 0;
+    std::string config_path = "/etc/wtunnel/client.ini";
+    for (int i = 1; i < argc - 1; i++) {
+        if (strcmp(argv[i], "-c") == 0) { config_path = argv[i + 1]; break; }
+    }
 
+    ClientConfig cfg = load_ini(config_path);
+
+    optind = 1;
+#ifdef _WIN32
+    optind_w = 1;
+#endif
     int opt;
-    while ((opt = getopt(argc, argv, "p:H:P:K:F:vh")) != -1) {
+    while ((opt = getopt(argc, argv, "p:H:P:K:F:c:vh")) != -1) {
         switch (opt) {
-        case 'p': local_port       = (uint16_t)std::stoi(optarg); break;
-        case 'H': tunnel_host      = optarg;                       break;
-        case 'P': tunnel_port      = (uint16_t)std::stoi(optarg); break;
-        case 'K': reality_psk      = optarg;                       break;
-        case 'F': fingerprint_path = optarg;                       break;
-        case 'v': ++verbose;                                        break;
+        case 'p': cfg.local_port       = (uint16_t)std::stoi(optarg); break;
+        case 'H': cfg.tunnel_host      = optarg;                       break;
+        case 'P': cfg.tunnel_port      = (uint16_t)std::stoi(optarg); break;
+        case 'K': cfg.reality_psk      = optarg;                       break;
+        case 'F': cfg.fingerprint_path = optarg;                       break;
+        case 'v': ++cfg.verbose;                                        break;
+        case 'c': break;
         case 'h': print_usage(argv[0]); return 0;
         default:  print_usage(argv[0]); return 1;
         }
     }
-    if (verbose >= 2)      set_log_level(LOG_DEBUG);
-    else if (verbose == 1) set_log_level(LOG_INFO);
+    if (cfg.verbose >= 2)      set_log_level(LOG_DEBUG);
+    else if (cfg.verbose == 1) set_log_level(LOG_INFO);
 
     PROXY_LOG_INFO("[main] Starting wtunnel client");
-    PROXY_LOG_INFO("[main] Local proxy  : 0.0.0.0:" << local_port);
-    PROXY_LOG_INFO("[main] Tunnel server: " << tunnel_host << ":" << tunnel_port);
-    if (!reality_psk.empty())
+    PROXY_LOG_INFO("[main] Config file : " << config_path);
+    PROXY_LOG_INFO("[main] Local proxy  : 0.0.0.0:" << cfg.local_port);
+    PROXY_LOG_INFO("[main] Tunnel server: " << cfg.tunnel_host << ":" << cfg.tunnel_port);
+    if (!cfg.reality_psk.empty())
         PROXY_LOG_INFO("[main] REALITY mode  : enabled");
 
-    ProxyServer proxy(local_port, tunnel_host, tunnel_port, reality_psk, fingerprint_path);
+    ProxyServer proxy(cfg.local_port, cfg.tunnel_host, cfg.tunnel_port,
+                      cfg.reality_psk, cfg.fingerprint_path);
     proxy.run();
     return 0;
 }

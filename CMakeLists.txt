@@ -144,3 +144,17 @@ else()
 endif()
 
 target_link_libraries(qtunnel_client PRIVATE ${PROXY_LINK_LIBS})
+
+# ── Install rules ─────────────────────────────────────────────────────────────
+include(GNUInstallDirs)
+
+install(TARGETS qtunnel_client DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+if(NOT WIN32)
+    install(FILES       ${CMAKE_SOURCE_DIR}/cmake/client.ini
+            DESTINATION /etc/wtunnel)
+    install(FILES       ${CMAKE_SOURCE_DIR}/patches/chrome146.txt
+            DESTINATION /etc/wtunnel)
+    install(FILES       ${CMAKE_SOURCE_DIR}/cmake/wtunnel-client.service
+            DESTINATION /etc/systemd/system)
+endif()
