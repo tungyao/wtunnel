@@ -881,7 +881,7 @@ public:
 
         struct sockaddr_in addr{};
         addr.sin_family      = AF_INET;
-        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
         addr.sin_port        = htons(local_port_);
 #ifdef _WIN32
         posix_compat::bind_fd(listen_fd_, (struct sockaddr*)&addr, sizeof(addr));
@@ -892,7 +892,7 @@ public:
 #endif
         set_nonblocking(listen_fd_);
 
-        PROXY_LOG_INFO("[proxy] Local HTTP proxy listening on 127.0.0.1:" << local_port_);
+        PROXY_LOG_INFO("[proxy] Local HTTP proxy listening on 0.0.0.0:" << local_port_);
         PROXY_LOG_INFO("[proxy] Tunnel server: " << config_.host << ":" << config_.port
                        << " (per-request connections, 0-RTT enabled)");
 
@@ -981,7 +981,7 @@ int main(int argc, char* argv[]) {
     }
 
     PROXY_LOG_INFO("[main] Starting wtunnel client");
-    PROXY_LOG_INFO("[main] Local proxy  : 127.0.0.1:" << local_port);
+    PROXY_LOG_INFO("[main] Local proxy  : 0.0.0.0:" << local_port);
     PROXY_LOG_INFO("[main] Tunnel server: " << tunnel_host << ":" << tunnel_port);
     if (!reality_psk.empty())
         PROXY_LOG_INFO("[main] REALITY mode  : enabled");
